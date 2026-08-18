@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "primo.global-menu",
+  "name": "Global menu",
+  "version": "1.0.0",
+  "author": "primo",
+  "license": "MIT",
+  "description": "macOS-style app menu bar for the focused window, driven by the omarchy-global-menu-bridge daemon.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Global menu",
+    "description": "Shows the focused window's menu in the bar.",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}
