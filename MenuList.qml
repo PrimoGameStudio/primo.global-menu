@@ -29,14 +29,23 @@ Item {
   property int chevronWidth: Style.space(12)
   property int rowPaddingX: Style.spacing.rowPaddingX
   property int itemSpacing: Style.space(8)
-  property int maxWidth: Style.space(340)
-  property int minWidth: Style.space(160)
+  property int maxWidth: Style.space(440)
+  property int minWidth: Style.space(200)
+  // Rendered glyphs frequently advance a hair wider than TextMetrics reports
+  // (hinting/rounding), which used to leave razor-thin or negative slack and
+  // ellipsize labels like "Previous Workspace" at full length.
+  property int measureSafety: Style.space(8)
+
+  // Height budget from the host popup (0 = uncapped). When the content is
+  // taller, the list scrolls inside that budget instead of overflowing.
+  property real maxListHeight: 0
+  readonly property bool scrollable: root.maxListHeight > 0 && column.implicitHeight > root.maxListHeight + 1
 
   signal activated(var item)
 
   property int hoveredRows: 0
   readonly property bool hovered: root.hoveredRows > 0
-    || (flyoutLoader.active && flyoutLoader.item && flyoutLoader.item.hovered === true)
+    || !!(flyoutLoader.active && flyoutLoader.item && flyoutLoader.item.hovered === true)
 
   readonly property var openFlyouts: {
     var result = []
@@ -120,10 +129,14 @@ Item {
   property int listWidth: root.minWidth
 
   function recomputeWidth() {
+    // Sync the measuring font imperatively: the TextMetrics binding can lag
+    // the theme's final font size at startup, under-measuring labels.
+    metrics.font.family = root.fontFamily
+    metrics.font.pixelSize = Style.font.bodySmall
     var items = root.items || []
     var widest = 0
     for (var i = 0; i < items.length; i++) widest = Math.max(widest, root.contentWidthFor(items[i]))
-    root.listWidth = Math.max(root.minWidth, Math.min(root.maxWidth, widest + root.rowPaddingX * 2))
+    root.listWidth = Math.max(root.minWidth, Math.min(root.maxWidth, widest + root.rowPaddingX * 2 + root.measureSafety))
   }
 
   onFontFamilyChanged: root.recomputeWidth()
@@ -149,17 +162,45 @@ Item {
   }
 
   implicitWidth: root.listWidth
-  implicitHeight: column.implicitHeight
+  implicitHeight: root.scrollable ? root.maxListHeight : column.implicitHeight
 
-  Column {
-    id: column
-    width: root.listWidth
-    spacing: 1
+  Flickable {
+    id: flick
+    anchors.fill: parent
+    clip: true
+    interactive: root.scrollable
+    boundsBehavior: Flickable.StopAtBounds
+    contentWidth: width
+    contentHeight: column.implicitHeight
 
-    Repeater {
-      model: root.items
-      delegate: rowDelegate
+    Column {
+      id: column
+      width: root.listWidth
+      spacing: 1
+
+      Repeater {
+        model: root.items
+        delegate: rowDelegate
+      }
     }
+  }
+
+  // Minimal scrollbar thumb, shown only while the list overflows its budget.
+  Rectangle {
+    visible: root.scrollable
+    parent: flick
+    anchors.right: parent.right
+    anchors.rightMargin: Style.space(1)
+    width: Style.space(3)
+    radius: width / 2
+    color: root.dimColor
+    opacity: 0.7
+
+    readonly property real thumbHeight: Math.max(Style.space(24), flick.height * (flick.height / Math.max(1, column.implicitHeight)))
+    height: thumbHeight
+    y: flick.height > thumbHeight && column.implicitHeight > flick.height
+      ? (flick.contentY / (column.implicitHeight - flick.height)) * (flick.height - thumbHeight)
+      : 0
   }
 
   Component {
@@ -172,7 +213,7 @@ Item {
 
       readonly property var item: row.modelData
       readonly property bool isSeparator: item.type === "separator"
-      readonly property bool isSubmenu: item.type === "menu" && item.items && item.items.length > 0
+      readonly property bool isSubmenu: !!(item.type === "menu" && item.items && item.items.length > 0)
       readonly property bool isEnabled: item.enabled !== false
       readonly property string checkState: String(item.checkState || "none")
       readonly property bool hasIndicator: checkState !== "none"
@@ -192,7 +233,7 @@ Item {
       Rectangle {
         visible: !row.isSeparator
         anchors.fill: parent
-        radius: Style.space(3)
+        radius: Math.min(Style.cornerRadius, row.height / 2)
         color: row.hovered ? root.selectedBackground : "transparent"
       }
 
@@ -302,8 +343,28 @@ Item {
 
         visible: root.activeFlyoutRow != null
         color: "transparent"
-        implicitWidth: flyoutList.item ? flyoutList.item.listWidth : root.minWidth
-        implicitHeight: flyoutList.item ? flyoutList.item.implicitHeight : 0
+
+        // Screen-height budget for nested menus (mirrors PopupCard.qml).
+        readonly property real maxListHeight: {
+          var win = anchorRow && anchorRow.QsWindow ? anchorRow.QsWindow.window : null
+          var scr = win && win.screen ? win.screen : null
+          if (!scr || scr.height <= 0) return 0
+          var margin = Style.space(8)
+          return Math.max(Style.space(160), scr.height - margin * 2)
+        }
+
+        function applyChildCap(list) {
+          if (!list) return
+          list.maxListHeight = Math.max(0, maxListHeight - flyoutCard.contentTopInset - flyoutCard.contentBottomInset)
+        }
+
+        onMaxListHeightChanged: applyChildCap(flyoutList.item)
+
+        implicitWidth: (flyoutList.item ? flyoutList.item.listWidth : root.minWidth)
+          + flyoutCard.contentLeftInset + flyoutCard.contentRightInset
+        implicitHeight: flyoutList.item
+          ? flyoutList.item.implicitHeight + flyoutCard.contentTopInset + flyoutCard.contentBottomInset
+          : flyoutCard.contentTopInset + flyoutCard.contentBottomInset
 
         anchor {
           id: flyoutAnchor
@@ -326,13 +387,13 @@ Item {
           }
         }
 
-        Rectangle {
+        BorderSurface {
           id: flyoutCard
           anchors.fill: parent
-          radius: Style.space(6)
           color: Color.popups.background
-          border.color: Color.popups.border
-          border.width: Math.max(1, Style.space(1))
+          borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border, Color.popups.border, Math.max(1, Style.space(1)))
+          padding: Style.space(4)
+          radius: Style.cornerRadius
 
           HoverHandler {
             id: flyoutCardHover
@@ -344,10 +405,14 @@ Item {
           id: flyoutList
           active: root.flyoutEverShown
           anchors.fill: flyoutCard
-          anchors.margins: Style.space(4)
+          anchors.topMargin: flyoutCard.contentTopInset
+          anchors.rightMargin: flyoutCard.contentRightInset
+          anchors.bottomMargin: flyoutCard.contentBottomInset
+          anchors.leftMargin: flyoutCard.contentLeftInset
           source: "MenuList.qml"
           onLoaded: {
             var list = item
+            flyout.applyChildCap(list)
             list.fontFamily = root.fontFamily
             list.foreground = root.foreground
             list.dimColor = root.dimColor

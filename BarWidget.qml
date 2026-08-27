@@ -23,6 +23,16 @@ BarWidget {
   property var openEntry: null
   property string lastAppId: ""
 
+  // Registered with the bar as our popout identity instead of the widget
+  // itself: the bar lights its open-panel indicator when activePopout matches
+  // the slot's item, which would underline the whole menubar strip. The proxy
+  // never matches, so the host indicator stays hidden while every switching
+  // contract (closeForPopoutSwitch / popoutSwitchClosing) still works.
+  readonly property var popoutOwner: ({
+    popoutSwitchClosing: false,
+    closeForPopoutSwitch: function() { root.setOpenIndex(-1) }
+  })
+
   function iconSource(icon) {
     var value = String(icon || "")
     if (value.length === 0) return ""
@@ -41,8 +51,8 @@ BarWidget {
     root.openEntry = (index >= 0 && entryRepeater && entryRepeater.itemAt) ? entryRepeater.itemAt(index) : null
     root.openIndex = index
     if (root.bar) {
-      if (opening) root.bar.requestPopout(root)
-      else if (closing && root.bar.activePopout === root) root.bar.releasePopout(root)
+      if (opening) root.bar.requestPopout(root.popoutOwner)
+      else if (closing && root.bar.activePopout === root.popoutOwner) root.bar.releasePopout(root.popoutOwner)
     }
     var pop = popupLoader.active ? popupLoader.item : null
     if (pop && pop.visible && pop.anchor) Qt.callLater(function() { pop.anchor.updateAnchor() })
@@ -58,7 +68,7 @@ BarWidget {
     } else if (kind === "hypr") {
       Quickshell.execDetached(["hyprctl", "dispatch", String(action.lua || "")])
     } else {
-      Quickshell.execDetached(["omarchy-global-menu-bridge", "activate", String(item.id)])
+      Quickshell.execDetached(["omarchy-global-menu-bridge", "activate", "--action-json", JSON.stringify(action)])
     }
   }
 
@@ -91,11 +101,23 @@ BarWidget {
     }
   }
 
-  function open(): void { if (root.menubar.length > 0 && root.openIndex < 0) root.setOpenIndex(0) }
+  function firstSubmenuIndex() {
+    for (var i = 0; i < root.menubar.length; i++) {
+      var m = root.menubar[i]
+      if (m && m.items && m.items.length > 0) return i
+    }
+    return -1
+  }
+
+  function open(): void {
+    var i = root.openIndex >= 0 ? root.openIndex : firstSubmenuIndex()
+    if (i < 0) return
+    root.setOpenIndex(i)
+  }
   function close(): void { root.setOpenIndex(-1) }
   function toggle(): void {
     if (root.openIndex >= 0) root.setOpenIndex(-1)
-    else if (root.menubar.length > 0) root.setOpenIndex(0)
+    else root.open()
   }
 
   IpcHandler {
@@ -121,7 +143,10 @@ BarWidget {
 
       Item {
         id: iconWrap
-        visible: root.appIconUrl !== "" && !root.vertical
+        // Non-empty icons that don't resolve to an image (file path or theme
+        // icon) are treated as Nerd Font glyphs and rendered as text.
+        readonly property bool hasGlyph: String(root.appIcon || "") !== "" && root.appIconUrl === ""
+        visible: (root.appIconUrl !== "" || iconWrap.hasGlyph) && !root.vertical
         width: Style.space(24)
         height: root.barSize
         implicitWidth: Style.space(24)
@@ -135,6 +160,17 @@ BarWidget {
           sourceSize.height: Style.space(16) * Screen.devicePixelRatio
           fillMode: Image.PreserveAspectFit
           asynchronous: true
+          visible: root.appIconUrl !== ""
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: iconWrap.hasGlyph
+          text: root.appIcon
+          color: root.bar ? root.bar.barForeground : Color.foreground
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.body
+          renderType: Text.NativeRendering
         }
       }
 
@@ -155,7 +191,10 @@ BarWidget {
       required property var modelData
 
       property bool hovered: false
-      readonly property string label: String(entry.modelData && entry.modelData.label || "")
+      readonly property var entryItem: entry.modelData
+      readonly property string label: String(entry.entryItem && entry.entryItem.label || "")
+      readonly property bool hasSubmenu: !!(entry.entryItem && entry.entryItem.items && entry.entryItem.items.length > 0)
+      readonly property bool hasAction: !!(entry.entryItem && entry.entryItem.action && entry.entryItem.action.kind)
       readonly property bool isOpen: root.openIndex === entry.index
       readonly property bool highlighted: entry.hovered || entry.isOpen
 
@@ -166,7 +205,7 @@ BarWidget {
       Rectangle {
         visible: entry.highlighted
         anchors.fill: parent
-        radius: Style.space(3)
+        radius: Math.min(Style.cornerRadius, entry.height / 2)
         color: entry.hovered ? Style.normalFill : Style.selectedFill
       }
 
@@ -175,7 +214,7 @@ BarWidget {
         anchors.centerIn: parent
         text: entry.label
         color: entry.highlighted
-          ? (root.bar ? root.bar.urgent : Color.urgent)
+          ? Color.menu.selectedText
           : (root.bar ? root.bar.barForeground : Color.foreground)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.body
@@ -187,10 +226,14 @@ BarWidget {
         hoverEnabled: true
         onEntered: {
           entry.hovered = true
-          if (root.openIndex >= 0 && root.openIndex !== entry.index) root.setOpenIndex(entry.index)
+          if (root.openIndex >= 0 && root.openIndex !== entry.index && entry.hasSubmenu) root.setOpenIndex(entry.index)
         }
         onExited: entry.hovered = false
         onClicked: {
+          if (!entry.hasSubmenu) {
+            if (entry.hasAction) root.activate(entry.entryItem)
+            return
+          }
           if (root.openIndex === entry.index) root.setOpenIndex(-1)
           else root.setOpenIndex(entry.index)
         }
@@ -213,10 +256,32 @@ BarWidget {
       readonly property var menu: root.menubar[root.openIndex]
       readonly property var anchorItem: root.openEntry !== null ? root.openEntry : strip
 
+      // Height budget for the menu list, derived from screen geometry so tall
+      // menus scroll instead of running off-screen (mirrors PopupCard.qml).
+      readonly property real maxListHeight: {
+        var win = anchorItem && anchorItem.QsWindow ? anchorItem.QsWindow.window : null
+        var scr = win && win.screen ? win.screen : null
+        if (!scr || scr.height <= 0) return 0
+        var margin = Style.space(8)
+        var reserved = 0
+        if (root.bar && (root.bar.position === "top" || root.bar.position === "bottom") && win) reserved += win.height
+        return Math.max(Style.space(160), scr.height - reserved - margin * 2)
+      }
+
+      function applyListCap(list) {
+        if (!list) return
+        list.maxListHeight = Math.max(0, maxListHeight - popupCard.contentTopInset - popupCard.contentBottomInset)
+      }
+
+      onMaxListHeightChanged: applyListCap(menuListLoader.item)
+
       visible: true
       color: "transparent"
-      implicitWidth: menuListLoader.item ? menuListLoader.item.listWidth : Style.space(160)
-      implicitHeight: menuListLoader.item ? menuListLoader.item.implicitHeight : 0
+      implicitWidth: (menuListLoader.item ? menuListLoader.item.listWidth : Style.space(160))
+        + popupCard.contentLeftInset + popupCard.contentRightInset
+      implicitHeight: menuListLoader.item
+        ? menuListLoader.item.implicitHeight + popupCard.contentTopInset + popupCard.contentBottomInset
+        : popupCard.contentTopInset + popupCard.contentBottomInset
 
       HyprlandFocusGrab {
         active: menuPopup.visible
@@ -251,21 +316,27 @@ BarWidget {
         }
       }
 
-      Rectangle {
+      BorderSurface {
         id: popupCard
         anchors.fill: parent
-        radius: Style.space(6)
         color: Color.popups.background
-        border.color: Color.popups.border
-        border.width: Math.max(1, Style.space(1))
+        borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border, Color.popups.border, Math.max(1, Style.space(1)))
+        padding: Style.space(4)
+        radius: Style.cornerRadius
       }
 
       Loader {
         id: menuListLoader
         anchors.fill: popupCard
-        anchors.margins: Style.space(4)
+        anchors.topMargin: popupCard.contentTopInset
+        anchors.rightMargin: popupCard.contentRightInset
+        anchors.bottomMargin: popupCard.contentBottomInset
+        anchors.leftMargin: popupCard.contentLeftInset
         source: "MenuList.qml"
-        onLoaded: menuPopup.wireMenuList(item)
+        onLoaded: {
+          menuPopup.applyListCap(item)
+          menuPopup.wireMenuList(item)
+        }
       }
 
       function wireMenuList(list) {
@@ -283,3 +354,4 @@ BarWidget {
     }
   }
 }
+ 

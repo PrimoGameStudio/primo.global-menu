@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "primo.global-menu",
   "name": "Global menu",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "primo",
   "license": "MIT",
   "description": "macOS-style app menu bar for the focused window, driven by the omarchy-global-menu-bridge daemon.",
