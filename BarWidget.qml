@@ -23,6 +23,10 @@ BarWidget {
   property var openEntry: null
   property string lastAppId: ""
 
+  // The bridge ships with this plugin, so resolve it relative to the
+  // plugin directory instead of relying on ~/.local/bin being on PATH.
+  readonly property string bridgePath: String(Qt.resolvedUrl("bin/omarchy-global-menu-bridge")).replace(/^file:\/\//, "")
+
   // Registered with the bar as our popout identity instead of the widget
   // itself: the bar lights its open-panel indicator when activePopout matches
   // the slot's item, which would underline the whole menubar strip. The proxy
@@ -68,7 +72,7 @@ BarWidget {
     } else if (kind === "hypr") {
       Quickshell.execDetached(["hyprctl", "dispatch", String(action.lua || "")])
     } else {
-      Quickshell.execDetached(["omarchy-global-menu-bridge", "activate", "--action-json", JSON.stringify(action)])
+      Quickshell.execDetached([root.bridgePath, "activate", "--action-json", JSON.stringify(action)])
     }
   }
 

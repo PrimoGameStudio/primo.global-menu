@@ -1,0 +1,2104 @@
+#!/usr/bin/env python3
+"""omarchy-global-menu-bridge — focused-app menus for the omarchy bar.
+
+Tracks the focused Hyprland window and publishes a JSON snapshot of its menu
+to ~/.local/state/omarchy/global-menu/active.json, where the
+primo.global-menu bar widget FileView-watches it.
+
+The menu is extracted from the app itself, in this order: org.gtk.Menus
+(GTK3), com.canonical.dbusmenu (KDE/Electron), the accessibility tree
+(AT-SPI: Qt, GTK4, Electron). Apps that expose none of those get the
+*desktop fallback* menu: the focused app's .desktop-file Actions plus
+standard window operations.
+
+The AT-SPI stage only works while apps keep their accessibility bridge
+enabled, which at-spi2-core >= 2.62 requires a registered AT-SPI event
+listener — see enable_atspi() below.
+
+Menu item ids in the snapshot are looked up again at trigger time: the widget
+writes {"id": "..."} to request.json and this process executes the stored
+action (hyprctl dispatch or a launched command) back in the app.
+"""
+
+import argparse
+import base64
+import configparser
+import json
+import os
+import select
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state")
+) / "omarchy" / "global-menu"
+ACTIVE_FILE = STATE_DIR / "active.json"
+REQUEST_FILE = STATE_DIR / "request.json"
+MENU_CONFIG_FILE = Path(
+    os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+) / "omarchy" / "global-menu.json"
+
+_MENU_CONFIG_DEFAULTS = {"name": "Omarchy", "icon": "omarchy"}
+_menu_config_cache = {"mtime": None, "data": dict(_MENU_CONFIG_DEFAULTS)}
+
+
+def load_menu_config():
+    """User overrides for the no-window-focused fallback menu.
+
+    Reads ~/.config/omarchy/global-menu.json: {"fallbackName": "...",
+    "fallbackIcon": "..."}. Missing/corrupt file or empty values fall back
+    to defaults. Mtime-cached so each snapshot build re-reads cheaply and
+    edits apply live.
+    """
+    try:
+        mtime = MENU_CONFIG_FILE.stat().st_mtime
+    except OSError:
+        mtime = None
+    if mtime != _menu_config_cache["mtime"]:
+        data = dict(_MENU_CONFIG_DEFAULTS)
+        if mtime is not None:
+            try:
+                parsed = json.loads(MENU_CONFIG_FILE.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    name = str(parsed.get("fallbackName") or "").strip()
+                    icon = str(parsed.get("fallbackIcon") or "").strip()
+                    if name:
+                        data["name"] = name
+                    if icon:
+                        data["icon"] = icon
+            except (OSError, json.JSONDecodeError):
+                pass
+        _menu_config_cache["mtime"] = mtime
+        _menu_config_cache["data"] = data
+    return _menu_config_cache["data"]
+
+
+_DESKTOP_CACHE = {}
+_EXTRACTION_CACHE = {}  # pid -> {source: timestamp}
+_RESPONSIVE_NAMES_CACHE = {}  # pid -> (timestamp, [names])
+
+
+def get_responsive_names(pid):
+    now = time.monotonic()
+    if pid in _RESPONSIVE_NAMES_CACHE:
+        ts, names = _RESPONSIVE_NAMES_CACHE[pid]
+        if now - ts < 15:
+            return names
+    names = [n for n in _unique_names_for_pid(pid) if _name_responsive(_bus(), n)]
+    _RESPONSIVE_NAMES_CACHE[pid] = (now, names)
+    if len(_RESPONSIVE_NAMES_CACHE) > 64:
+        oldest = min(_RESPONSIVE_NAMES_CACHE, key=lambda k: _RESPONSIVE_NAMES_CACHE[k][0])
+        del _RESPONSIVE_NAMES_CACHE[oldest]
+    return names
+
+
+def check_negative_cache(pid, source):
+    now = time.monotonic()
+    entry = _EXTRACTION_CACHE.get(pid)
+    if entry and source in entry:
+        if now - entry[source] < 60:
+            return True
+    return False
+
+
+def mark_negative_cache(pid, source):
+    now = time.monotonic()
+    if pid not in _EXTRACTION_CACHE:
+        _EXTRACTION_CACHE[pid] = {}
+    _EXTRACTION_CACHE[pid][source] = now
+    if len(_EXTRACTION_CACHE) > 64:
+        # min() over dict_values objects is not orderable, so unwrap the
+        # per-pid mapping first: the oldest entry is the one whose most
+        # recent negative hit is furthest in the past.
+        oldest = min(_EXTRACTION_CACHE, key=lambda k: min(_EXTRACTION_CACHE[k].values()))
+        del _EXTRACTION_CACHE[oldest]
+
+
+def clear_negative_cache(pid, source):
+    if pid in _EXTRACTION_CACHE and source in _EXTRACTION_CACHE[pid]:
+        del _EXTRACTION_CACHE[pid][source]
+
+DESKTOP_DIRS = [
+    Path.home() / ".local/share/applications",
+    Path.home() / ".local/share/flatpak/exports/share/applications",
+    Path("/usr/local/share/applications"),
+    Path("/usr/share/applications"),
+    Path("/var/lib/flatpak/exports/share/applications"),
+    Path("/var/lib/snapd/desktop/applications"),
+]
+
+DEBUG = False
+
+
+def log(msg):
+    if DEBUG:
+        print(f"omarchy-global-menu-bridge: {msg}", file=sys.stderr, flush=True)
+
+
+def hypr_instance_dir():
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    hypr = runtime / "hypr"
+    best = None
+    best_mtime = -1
+    if hypr.is_dir():
+        for entry in hypr.iterdir():
+            sock = entry / ".socket2.sock"
+            lock = entry / "hyprland.lock"
+            if not sock.is_socket():
+                continue
+            mtime = lock.stat().st_mtime if lock.exists() else 0
+            if mtime >= best_mtime:
+                best = entry
+                best_mtime = mtime
+    return best
+
+
+def run_hyprctl(args, timeout=5.0):
+    try:
+        proc = subprocess.run(
+            ["hyprctl"] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.stdout
+    except Exception as exc:  # noqa: BLE001
+        log(f"hyprctl {args} failed: {exc}")
+        return ""
+
+
+def active_window():
+    raw = run_hyprctl(["-j", "activewindow"])
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# Windows owned by the shell itself (bar, panels, popup menus). Grabbing
+# focus for the menu popup or clicking the bar surfaces these as the active
+# window; the global menu must keep the last real app's menu instead of
+# switching to a Quickshell fallback.
+SHELL_CLASSES = {"org.quickshell", "quickshell"}
+
+
+def is_shell_window(window):
+    window_class = str((window or {}).get("class", "") or "")
+    return window_class in SHELL_CLASSES
+
+
+def find_desktop_file(app_id):
+    if not app_id:
+        return None
+    if app_id in _DESKTOP_CACHE:
+        return _DESKTOP_CACHE[app_id]
+    candidates = []
+    for base in DESKTOP_DIRS:
+        if not base.is_dir():
+            continue
+        exact = base / f"{app_id}.desktop"
+        if exact.is_file():
+            _DESKTOP_CACHE[app_id] = exact
+            return exact
+        for desktop in base.glob("*.desktop"):
+            candidates.append(desktop)
+    app_id_l = app_id.lower()
+    best = None
+    best_score = -1
+    for desktop in candidates:
+        stem = desktop.stem.lower()
+        score = 0
+        if stem in app_id_l:
+            score = 10 + len(stem)
+        elif app_id_l in stem:
+            score = 5
+        try:
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            parser.read(desktop)
+            wm_class = (parser.get("Desktop Entry", "StartupWMClass", fallback="") or "").lower()
+            if wm_class and (wm_class == app_id_l or app_id in wm_class):
+                score = max(score, 15)
+        except (configparser.Error, OSError):
+            continue
+        if score > best_score:
+            best = desktop
+            best_score = score
+    _DESKTOP_CACHE[app_id] = best
+    return best
+
+
+def parse_desktop(path):
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read(path)
+    except (configparser.Error, OSError):
+        return None
+    section = "Desktop Entry"
+    if not parser.has_section(section):
+        return None
+    name = parser.get(section, "Name", fallback="")
+    icon = parser.get(section, "Icon", fallback="")
+    exec_line = parser.get(section, "Exec", fallback="")
+    actions_raw = parser.get(section, "Actions", fallback="").strip()
+    actions = []
+    for action_id in [a for a in actions_raw.split(";") if a.strip()]:
+        section_name = f"Desktop Action {action_id}"
+        if not parser.has_section(section_name):
+            continue
+        action_exec = parser.get(section_name, "Exec", fallback="")
+        action_name = parser.get(section_name, "Name", fallback=action_id)
+        action_icon = parser.get(section_name, "Icon", fallback=icon)
+        if action_exec:
+            actions.append({"id": action_id, "name": action_name, "exec": action_exec, "icon": action_icon})
+    return {"name": name, "icon": icon, "exec": exec_line, "actions": actions}
+
+
+def clean_exec(exec_line):
+    """Strip desktop-file field codes and env prefixes from an Exec line."""
+    if not exec_line:
+        return ""
+    try:
+        tokens = shlex.split(exec_line)
+    except ValueError:
+        return exec_line.strip()
+    if not tokens:
+        return ""
+    if tokens[0] == "env":
+        i = 1
+        while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("="):
+            i += 1
+        tokens = tokens[i:]
+    tokens = [t for t in tokens if not (t.startswith("%") and len(t) > 1)]
+    if not tokens:
+        return ""
+    return shlex.join(tokens)
+
+
+def clean_menu_label(label):
+    """Strip Tab-separated accelerator/hint suffixes GTK apps embed in labels."""
+    if not label:
+        return ""
+    return str(label).split("\t")[0]
+
+
+# ---------------------------------------------------------------------------
+# org.gtk.Menus extraction (step 2 of the cascade)
+#
+# GTK3/GtkApplication apps export their menubar over D-Bus with the
+# org.gtk.Menus interface (gio g_dbus_connection_export_menu_model). Discovery:
+#   1. find the D-Bus unique names owned by the focused window's process
+#   2. introspect each name's object tree for an org.gtk.Application object
+#   3. the menubar lives at <app object path>/menus/menubar
+# Wire format (validated against a real GTK3 exporter):
+#   org.gtk.Menus.Start(au group_ids) -> a(uuaa{sv})
+#   each entry = (group_id, menu_id, [item_attr_dict, ...]); item attrs carry
+#   'label', 'action', 'target', ':submenu'/(g,m), ':section'/(g,m), 'enabled',
+#   'hidden-when', 'toggle-type', 'toggle-state'. Root menubar is group 0.
+# Activation: org.freedesktop.Application.ActivateAction(action, av params, {}).
+# ---------------------------------------------------------------------------
+
+_gio = None
+
+
+def _gio_import():
+    global _gio  # noqa: F811
+    if _gio is None:
+        import gi  # noqa: PLC0415
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib  # noqa: PLC0415
+
+        _gio = (Gio, GLib)
+    return _gio
+
+
+_atspi = None
+
+
+def _atspi_import():
+    global _atspi  # noqa: F811
+    if _atspi is None:
+        import gi  # noqa: PLC0415
+
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi  # noqa: PLC0415
+
+        _atspi = Atspi
+    return _atspi
+
+
+_dbus = None
+
+
+def _bus():
+    global _dbus  # noqa: F811
+    if _dbus is None:
+        Gio, _ = _gio_import()
+        _dbus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return _dbus
+
+
+# --- AT-SPI enablement -------------------------------------------------
+#
+# at-spi2-core >= 2.62 dropped the org.a11y.Status.ScreenReaderEnabled
+# property and re-purposed IsEnabled to mean "some client registered for
+# AT-SPI events" (see bus/at-spi-bus-launcher.c). Qt decides whether to
+# activate its AT-SPI bridge from exactly that signal:
+#
+#   enabled = QT_LINUX_ACCESSIBILITY_ALWAYS_ON
+#             || status.ScreenReaderEnabled || status.IsEnabled
+#
+# With neither property set, Qt keeps the bridge off, apps export an empty
+# accessible tree, and no menu can be extracted from them (they fall back to
+# the synthetic desktop menu). Registering as an event listener is what a
+# screen reader does, and it flips IsEnabled on for every app on the bus.
+_A11Y_EVENT = "object:state-changed:focused"
+_a11y_conn = None
+
+
+def a11y_bus_address():
+    """Address of the accessibility bus (a separate bus from the session one)."""
+    addr = os.environ.get("AT_SPI_BUS_ADDRESS")
+    if addr:
+        return addr
+    Gio, _ = _gio_import()
+    try:
+        reply = _bus().call_sync(
+            "org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.a11y.Bus",
+            "GetAddress",
+            None,
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        )
+        return reply.unpack()[0]
+    except Exception as exc:  # noqa: BLE001
+        log(f"a11y bus address unavailable: {exc}")
+        return None
+
+
+def enable_atspi(force=False):
+    """Register with the a11y registry so apps expose their menus.
+
+    Keeps a connection to the accessibility bus open for the lifetime of the
+    process: the launcher watches that name and keeps IsEnabled true only
+    while it is owned. Safe to call repeatedly; it re-registers after the
+    a11y bus is restarted, and re-announces the registration periodically in
+    case the launcher itself was restarted.
+    """
+    global _a11y_conn  # noqa: F811
+    try:
+        Gio, GLib = _gio_import()
+        if _a11y_conn is not None and _a11y_conn.is_closed():
+            _a11y_conn = None
+        if _a11y_conn is None:
+            addr = a11y_bus_address()
+            if not addr:
+                return False
+            _a11y_conn = Gio.DBusConnection.new_for_address_sync(
+                addr,
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                None,
+                None,
+            )
+            log(f"connected to the accessibility bus as {_a11y_conn.get_unique_name()}")
+        _a11y_conn.call_sync(
+            "org.a11y.atspi.Registry",
+            "/org/a11y/atspi/registry",
+            "org.a11y.atspi.Registry",
+            "RegisterEvent",
+            GLib.Variant("(sass)", (_A11Y_EVENT, [], _a11y_conn.get_unique_name())),
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        )
+        if force:
+            log(f"re-registered AT-SPI event listener as {_a11y_conn.get_unique_name()}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"AT-SPI registration failed: {exc}")
+        _a11y_conn = None
+        return False
+
+
+def force_a11y_enabled():
+    """Best-effort `org.a11y.Status.IsEnabled = true` on the session bus.
+
+    The registry registration above is the mechanism that keeps this flag
+    accurate; this only covers the case where the registry refuses our
+    registration but the launcher still honours the property.
+    """
+    Gio, GLib = _gio_import()
+    try:
+        _bus().call_sync(
+            "org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.freedesktop.DBus.Properties",
+            "Set",
+            GLib.Variant("(ssv)", ("org.a11y.Status", "IsEnabled", GLib.Variant("b", True))),
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        )
+        log("set org.a11y.Status.IsEnabled = true")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not set org.a11y.Status.IsEnabled: {exc}")
+        return False
+
+
+def _introspect(conn, name, path, timeout=500):
+    Gio, _ = _gio_import()
+    try:
+        reply = conn.call_sync(
+            name,
+            path,
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            None,
+            None,
+            Gio.DBusCallFlags.NONE,
+            timeout,
+        )
+        return reply.unpack()[0]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _name_responsive(conn, name, timeout=250):
+    """Quick probe: does `name` answer introspection at all?
+
+    Some connections (e.g. an app's secondary GUI connection) hang on every
+    Introspect call, so crawling their tree would cost `timeout` per node.
+    A single fast probe on `/` lets callers skip such names outright.
+    """
+    xml = _introspect(conn, name, "/", timeout=timeout)
+    if xml is None:
+        return False
+    # A name that owns no exported objects returns an empty <node/>.
+    return "<node" in xml
+
+
+def _unique_names_for_pid(pid):
+    """Unique D-Bus names owned by pid or one of its ancestors (GTK apps often
+    fork; the GApplication connection may live in the parent process)."""
+    Gio, GLib = _gio_import()
+    conn = _bus()
+    try:
+        names = conn.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ListNames",
+            None,
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        ).unpack()[0]
+    except Exception:  # noqa: BLE001
+        return []
+    pids = set()
+    cur = pid
+    for _ in range(4):
+        if not cur:
+            break
+        pids.add(cur)
+        try:
+            with open(f"/proc/{cur}/stat") as fh:
+                parts = fh.read().split()
+            cur = int(parts[3])
+        except (OSError, ValueError, IndexError):
+            break
+    owned = []
+    for name in names:
+        if not name.startswith(":"):
+            continue
+        try:
+            reply = conn.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetConnectionUnixProcessID",
+                GLib.Variant("(s)", (name,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                2000,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if reply.unpack()[0] in pids:
+            owned.append(name)
+    return owned
+
+
+def _walk_gtk_app_objects(conn, name, max_depth=5):
+    """Object paths on `name` implementing org.gtk.Application."""
+    found = []
+    budget = [40]  # total Introspect calls per name; systemd's tree is huge
+
+    def walk(path, depth):
+        if depth > max_depth or budget[0] <= 0:
+            return
+        budget[0] -= 1
+        xml = _introspect(conn, name, path)
+        if xml is None:
+            return
+        if "org.gtk.Application" in xml:
+            found.append(path)
+        for line in xml.splitlines():
+            line = line.strip()
+            if line.startswith("<node name="):
+                child = line.split('name="')[1].split('"')[0]
+                if child.startswith("/"):
+                    walk(child, depth + 1)
+                else:
+                    walk(path.rstrip("/") + "/" + child, depth + 1)
+
+    walk("/", 0)
+    return found
+
+
+def _serialize_variant(variant):
+    """JSON-safe form of a GVariant: {type, data(base64 of serialized bytes)}."""
+    GLib = _gio_import()[1]
+    try:
+        data = variant.get_data()
+    except Exception:  # noqa: BLE001
+        return None
+    return {"type": variant.get_type_string(), "data": base64.b64encode(data).decode("ascii")}
+
+
+def _action_state_map(conn, name, app_path):
+    """Action name -> enabled flag, from org.gtk.Actions.DescribeAll."""
+    Gio, _ = _gio_import()
+    try:
+        reply = conn.call_sync(
+            name,
+            app_path,
+            "org.gtk.Actions",
+            "DescribeAll",
+            None,
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        )
+        return {key: (bool(desc[0]), desc[1]) for key, desc in reply.unpack()[0].items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+class GtkMenuExtractor:
+    """Pulls a focused GTK app's menubar into the snapshot schema."""
+
+    def __init__(self, pid, app_name, address):
+        self.pid = pid
+        self.app_name = app_name
+        self.address = address
+        self.counter = 0
+        self.found = None  # (bus_name, app_path, menubar_path)
+
+    def nid(self, prefix):
+        self.counter += 1
+        return f"{prefix}.{self.counter}"
+
+    def discover(self):
+        Gio, _ = _gio_import()
+        conn = _bus()
+        for name in get_responsive_names(self.pid):
+            for app_path in _walk_gtk_app_objects(conn, name):
+                menubar_path = app_path.rstrip("/") + "/menus/menubar"
+                xml = _introspect(conn, name, menubar_path)
+                if xml and "org.gtk.Menus" in xml:
+                    self.found = (name, app_path, menubar_path)
+                    return True
+        return False
+
+    def _start(self, groups):
+        Gio, GLib = _gio_import()
+        conn = _bus()
+        name, _, menubar_path = self.found
+        reply = conn.call_sync(
+            name,
+            menubar_path,
+            "org.gtk.Menus",
+            "Start",
+            GLib.Variant("(au)", (groups,)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        )
+        return reply.unpack()[0]
+
+    def build(self):
+        if not self.discover():
+            return None
+        Gio, GLib = _gio_import()
+        conn = _bus()
+        name, app_path, _ = self.found
+        states = _action_state_map(conn, name, app_path)
+
+        def describe_action(attrs):
+            """(label, action_name, target, enabled, hidden) for an item."""
+            action = attrs.get("action")
+            enabled = attrs.get("enabled", True)
+            hidden = False
+            if action:
+                base = action.split(".", 1)[1] if "." in action else action
+                hw = attrs.get("hidden-when", "")
+                known = base in states
+                if hw == "action-disabled":
+                    hidden = known and not states[base][0]
+                elif hw == "action-missing":
+                    hidden = not known
+                if known:
+                    enabled = bool(states[base][0])
+            return (
+                clean_menu_label(attrs.get("label", "")),
+                action,
+                attrs.get("target"),
+                enabled,
+                hidden,
+            )
+
+        def action_action(action, target):
+            if not action:
+                return None
+            prefix, _, base = action.partition(".")
+            if prefix not in ("app", "win"):
+                return None
+            action_obj = {
+                "kind": "gtk-action",
+                "bus": name,
+                "path": app_path,
+                "action": base,
+            }
+            if target is not None:
+                serialized = _serialize_variant(target)
+                if serialized:
+                    action_obj["target"] = serialized
+            return action_obj
+
+        def separator():
+            return {
+                "id": self.nid("gtk"),
+                "label": "",
+                "type": "separator",
+                "enabled": False,
+                "icon": "",
+                "checkState": "none",
+                "action": None,
+            }
+
+        memo = {}
+
+        def fetch_group(group_id):
+            if group_id not in memo:
+                memo[group_id] = self._start([group_id])
+            return memo[group_id]
+
+        def build_menu(group_id, menu_id, depth=0):
+            """Items of one specific menu (group_id, menu_id)."""
+            if depth > 6:
+                return []
+            items = []
+            last_section = None
+            for gid, mid, attrs_list in fetch_group(group_id):
+                if mid != menu_id:
+                    continue
+                for attrs in attrs_list:
+                    label, action, target, enabled, hidden = describe_action(attrs)
+                    sub = attrs.get(":submenu")
+                    if sub:
+                        sg, sm = sub
+                        children = build_menu(sg, sm, depth + 1)
+                        items.append(
+                            {
+                                "id": self.nid("gtk"),
+                                "label": label,
+                                "type": "menu",
+                                "enabled": enabled,
+                                "icon": "",
+                                "checkState": "none",
+                                "action": action_action(action, target) if action else None,
+                                "items": children,
+                            }
+                        )
+                        continue
+                    sec = attrs.get(":section")
+                    if sec:
+                        sg, sm = sec
+                        sub_items = build_menu(sg, sm, depth + 1)
+                        if items and last_section != sm:
+                            items.append(separator())
+                        items.extend(sub_items)
+                        last_section = sm
+                        continue
+                    if hidden:
+                        continue
+                    items.append(
+                        {
+                            "id": self.nid("gtk"),
+                            "label": label,
+                            "type": "item",
+                            "enabled": enabled,
+                            "icon": "",
+                            "checkState": "none",
+                            "action": action_action(action, target) if action else None,
+                        }
+                    )
+            return items
+
+        menubar = []
+        for gid, mid, attrs_list in fetch_group(0):
+            if mid != 0:
+                continue  # the root menubar is menu (0, 0); other menus in
+                # group 0 are section menus referenced from it
+            for attrs in attrs_list:
+                label, action, target, enabled, hidden = describe_action(attrs)
+                link = attrs.get(":submenu")
+                if link:
+                    sg, sm = link
+                    menubar.append(
+                        {
+                            "id": self.nid("gtk"),
+                            "label": label,
+                            "type": "menu",
+                            "enabled": enabled,
+                            "icon": "",
+                            "checkState": "none",
+                            "action": action_action(action, target) if action else None,
+                            "items": build_menu(sg, sm),
+                        }
+                    )
+                    continue
+                section = attrs.get(":section")
+                if section:
+                    sg, sm = section
+                    for entry in build_menu(sg, sm):
+                        items = []
+                        if entry["type"] == "menu":
+                            items = entry["items"]
+                        elif entry["type"] == "item":
+                            items = [dict(entry, id=self.nid("gtk"))]
+                        if not items:
+                            continue
+                        menubar.append(
+                            {
+                                "id": self.nid("gtk"),
+                                "label": entry["label"],
+                                "type": "menu",
+                                "enabled": entry["enabled"],
+                                "icon": "",
+                                "checkState": "none",
+                                "action": entry.get("action"),
+                                "items": items,
+                            }
+                        )
+                    continue
+                if hidden:
+                    continue
+                items = []
+                if action and not link:
+                    items = [
+                        {
+                            "id": self.nid("gtk"),
+                            "label": label,
+                            "type": "item",
+                            "enabled": enabled,
+                            "icon": "",
+                            "checkState": "none",
+                            "action": action_action(action, target),
+                        }
+                    ]
+                menubar.append(
+                    {
+                        "id": self.nid("gtk"),
+                        "label": label,
+                        "type": "menu",
+                        "enabled": enabled,
+                        "icon": "",
+                        "checkState": "none",
+                        "action": action_action(action, target) if action else None,
+                        "items": items,
+                    }
+                )
+        return menubar
+
+
+def _extract_gtk_menubar(pid, app_name, address):
+    try:
+        extractor = GtkMenuExtractor(pid, app_name, address)
+        menubar = extractor.build()
+        return menubar, extractor.found
+    except Exception as exc:  # noqa: BLE001
+        log(f"org.gtk.Menus extraction failed: {exc}")
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# DBusMenu (com.canonical.dbusmenu) extraction (step 3 of the cascade)
+#
+# The DBusMenu protocol is what GTK apps export when the appmenu-gtk-module
+# is active, plus KDE/libdbusmenu apps (nemo, some electron apps, ...). The
+# object implements com.canonical.dbusmenu at a well-known path such as
+# /MenuBar. Layout is fetched in one shot with GetLayout(0, -1, []):
+#   reply (u, (ia{sv}av)) -> (revision, root); root is (id, props, children)
+# where children is an array of variants, each a nested (ia{sv}av) struct.
+# Item properties: label, type (normal/separator/checkmark/radio/title),
+# enabled, visible, toggle-state, toggle-type, children-display, icon-name.
+# Activation: Event(id, "clicked", data, timestamp) -> (b).
+# ---------------------------------------------------------------------------
+
+DBUSMENU_PATHS = [
+    "/MenuBar",
+    "/com/canonical/dbusmenu",
+    "/com/canonical/menu",
+    "/com/canonical/unity/panel/ApplicationMenus",
+]
+
+
+class DbusMenuExtractor:
+    """Pulls a focused app's DBusMenu into the snapshot schema."""
+
+    def __init__(self, pid, app_name, address):
+        self.pid = pid
+        self.app_name = app_name
+        self.address = address
+        self.counter = 0
+        self.found = None  # (bus_name, object_path)
+
+    def nid(self, prefix):
+        self.counter += 1
+        return f"{prefix}.{self.counter}"
+
+    def _walk_interface(self, conn, name, path, depth):
+        if depth > 6 or self._walk_budget <= 0:
+            return None
+        self._walk_budget -= 1
+        xml = _introspect(conn, name, path)
+        if xml is None:
+            return None
+        if "com.canonical.dbusmenu" in xml:
+            return path
+        for line in xml.splitlines():
+            line = line.strip()
+            if line.startswith("<node name="):
+                child = line.split('name="')[1].split('"')[0]
+                if child.startswith("/"):
+                    res = self._walk_interface(conn, name, child, depth + 1)
+                else:
+                    res = self._walk_interface(conn, name, path.rstrip("/") + "/" + child, depth + 1)
+                if res:
+                    return res
+        return None
+
+    def discover(self):
+        Gio, _ = _gio_import()
+        conn = _bus()
+        self._walk_budget = 40
+        for name in get_responsive_names(self.pid):
+            for path in DBUSMENU_PATHS:
+                xml = _introspect(conn, name, path)
+                if xml and "com.canonical.dbusmenu" in xml:
+                    self.found = (name, path)
+                    return True
+            path = self._walk_interface(conn, name, "/", 0)
+            if path:
+                self.found = (name, path)
+                return True
+        return False
+
+    def _get_layout(self):
+        Gio, GLib = _gio_import()
+        conn = _bus()
+        name, path = self.found
+        reply = conn.call_sync(
+            name,
+            path,
+            "com.canonical.dbusmenu",
+            "GetLayout",
+            GLib.Variant("(iias)", (0, -1, [])),
+            None,
+            Gio.DBusCallFlags.NONE,
+            2000,
+        )
+        return reply.unpack()
+
+    def build(self):
+        if not self.discover():
+            return None
+        Gio, _ = _gio_import()
+        _, root = self._get_layout()
+
+        def separator():
+            return {
+                "id": self.nid("dbm"),
+                "label": "",
+                "type": "separator",
+                "enabled": False,
+                "icon": "",
+                "checkState": "none",
+                "action": None,
+            }
+
+        def action_for(item_id):
+            name, path = self.found
+            return {"kind": "dbusmenu-event", "bus": name, "path": path, "id": item_id}
+
+        def build_menu(node, depth=0):
+            if depth > 8:
+                return []
+            items_out = []
+            for child in node[2]:
+                cid, cprops, cchildren = child
+                label = clean_menu_label(str(cprops.get("label") or ""))
+                itype = str(cprops.get("type") or "normal")
+                if not cprops.get("visible", True):
+                    continue
+                enabled = bool(cprops.get("enabled", True))
+                if itype == "separator":
+                    items_out.append(separator())
+                    continue
+                has_children = bool(cchildren)
+                submenu = str(cprops.get("children-display") or "") == "submenu"
+                if has_children or submenu:
+                    items_out.append(
+                        {
+                            "id": self.nid("dbm"),
+                            "label": label,
+                            "type": "menu",
+                            "enabled": enabled,
+                            "icon": str(cprops.get("icon-name") or ""),
+                            "checkState": "none",
+                            "action": action_for(cid),
+                            "items": build_menu(child, depth + 1),
+                        }
+                    )
+                    continue
+                check = "none"
+                if itype == "checkmark":
+                    check = "check" if cprops.get("toggle-state", 0) else "none"
+                elif itype == "radio":
+                    check = "radio" if cprops.get("toggle-state", 0) else "none"
+                item_type = "item"
+                if itype == "title":
+                    item_type = "item"
+                    enabled = False
+                items_out.append(
+                    {
+                        "id": self.nid("dbm"),
+                        "label": label,
+                        "type": item_type,
+                        "enabled": enabled,
+                        "icon": str(cprops.get("icon-name") or ""),
+                        "checkState": check,
+                        "action": action_for(cid),
+                    }
+                )
+            return items_out
+
+        menubar = []
+        for child in root[2]:
+            cid, cprops, _ = child
+            if not cprops.get("visible", True):
+                continue
+            label = clean_menu_label(str(cprops.get("label") or ""))
+            menubar.append(
+                {
+                    "id": self.nid("dbm"),
+                    "label": label,
+                    "type": "menu",
+                    "enabled": bool(cprops.get("enabled", True)),
+                    "icon": str(cprops.get("icon-name") or ""),
+                    "checkState": "none",
+                    "action": action_for(cid),
+                    "items": build_menu(child),
+                }
+            )
+        return menubar
+
+
+def _extract_dbusmenu(pid, app_name, address):
+    try:
+        extractor = DbusMenuExtractor(pid, app_name, address)
+        menubar = extractor.build()
+        return menubar, extractor.found
+    except Exception as exc:  # noqa: BLE001
+        log(f"DBusMenu extraction failed: {exc}")
+        return None, None
+
+
+class AtspiMenuExtractor:
+    """Pulls a focused app's accessibility menubar into the snapshot schema.
+
+    AT-SPI is the deepest fallback: it works for toolkits/apps that expose
+    neither org.gtk.Menus nor com.canonical.dbusmenu (GTK apps with a
+    traditional menubar, some Electron/Chromium-family apps, etc.).
+    """
+
+    # Roles that act as a menubar or open a submenu.
+    _MENUBAR_ROLES = {
+        "ATSPI_ROLE_MENU_BAR",
+        "ATSPI_ROLE_MENU",
+    }
+    _SUBMENU_ROLES = {
+        "ATSPI_ROLE_MENU",
+        "ATSPI_ROLE_POPUP_MENU",
+    }
+    _ITEM_ROLES = {
+        "ATSPI_ROLE_MENU_ITEM",
+        "ATSPI_ROLE_CHECK_MENU_ITEM",
+        "ATSPI_ROLE_RADIO_MENU_ITEM",
+        "ATSPI_ROLE_MENU",
+    }
+
+    def __init__(self, pid, app_name, address):
+        self.pid = pid
+        self.app_name = app_name
+        self.address = address
+        self.counter = 0
+        self.found = None  # (app, menubar_accessibles)
+
+    def nid(self, prefix):
+        self.counter += 1
+        return f"{prefix}.{self.counter}"
+
+    @staticmethod
+    def _role(acc):
+        try:
+            role = acc.get_role()
+            return role.value_name if role else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _name(acc):
+        try:
+            return (acc.get_name() or "") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _state(acc):
+        try:
+            return acc.get_state_set()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _enabled(acc):
+        states = AtspiMenuExtractor._state(acc)
+        if states is None:
+            return True
+        try:
+            return bool(states.contains(Atspi.StateType.SENSITIVE))
+        except Exception:  # noqa: BLE001
+            return True
+
+    @staticmethod
+    def _checkstate(acc):
+        states = AtspiMenuExtractor._state(acc)
+        if states is None:
+            return "none"
+        try:
+            role = AtspiMenuExtractor._role(acc)
+            if "RADIO" in role:
+                if states.contains(Atspi.StateType.CHECKED):
+                    return "radio"
+            elif "CHECK" in role:
+                if states.contains(Atspi.StateType.CHECKED):
+                    return "check"
+            elif states.contains(Atspi.StateType.CHECKED) or states.contains(Atspi.StateType.SELECTED):
+                return "check"
+        except Exception:  # noqa: BLE001
+            pass
+        return "none"
+
+    def _find_role(self, acc, roles, depth=0):
+        """First accessible whose role is in `roles` (depth-first)."""
+        if depth > 12:
+            return None
+        if self._role(acc) in roles:
+            return acc
+        try:
+            count = acc.get_child_count()
+        except Exception:  # noqa: BLE001
+            return None
+        if count > 500:
+            return None
+        for i in range(count):
+            try:
+                child = acc.get_child_at_index(i)
+            except Exception:  # noqa: BLE001
+                continue
+            if child is None:
+                continue
+            found = self._find_role(child, roles, depth + 1)
+            if found:
+                return found
+        return None
+
+    def _walk_for_menubar(self, acc, depth=0):
+        """Prefer a MENU_BAR; fall back to a MENU with children."""
+        menubar = self._find_role(acc, {"ATSPI_ROLE_MENU_BAR"})
+        if menubar:
+            return menubar
+        return self._find_role(acc, {"ATSPI_ROLE_MENU"})
+
+    def discover(self):
+        Atspi = _atspi_import()
+        try:
+            desktop = Atspi.get_desktop(0)
+        except Exception as exc:  # noqa: BLE001
+            log(f"AT-SPI desktop unavailable: {exc}")
+            return False
+        try:
+            count = desktop.get_child_count()
+        except Exception:  # noqa: BLE001
+            return False
+        for i in range(count):
+            try:
+                app = desktop.get_child_at_index(i)
+            except Exception:  # noqa: BLE001
+                continue
+            if app is None:
+                continue
+            try:
+                app_pid = app.get_process_id()
+            except Exception:  # noqa: BLE001
+                continue
+            if app_pid != self.pid:
+                continue
+            menubar = self._walk_for_menubar(app)
+            if menubar:
+                self.found = (app, menubar)
+                return True
+        return False
+
+    def _index_of(self, acc):
+        try:
+            return acc.get_index_in_parent()
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def _menubar_path(self, menubar):
+        """Child-index path from the app accessible down to the menubar."""
+        path = []
+        app = self.found[0]
+        try:
+            cur = menubar
+            while cur is not None:
+                parent = cur.get_parent()
+                if parent is None or cur is app:
+                    break
+                path.append(self._index_of(cur))
+                cur = parent
+        except Exception:  # noqa: BLE001
+            pass
+        path.reverse()
+        return path
+
+    def _clean_label(self, label):
+        return label.split("\t")[0]
+
+    def _extract_children(self, parent_acc, prefix, base_path, depth=0):
+        """Convert a menu's child accessibles into snapshot items."""
+        if depth > 10:
+            return []
+        try:
+            count = parent_acc.get_child_count()
+        except Exception:  # noqa: BLE001
+            return []
+        items_out = []
+        for i in range(count):
+            try:
+                child = parent_acc.get_child_at_index(i)
+            except Exception:  # noqa: BLE001
+                continue
+            if child is None:
+                continue
+            role = self._role(child)
+            if role == "ATSPI_ROLE_SEPARATOR":
+                items_out.append(
+                    {
+                        "id": self.nid(prefix),
+                        "label": "",
+                        "type": "separator",
+                        "enabled": False,
+                        "icon": "",
+                        "checkState": "none",
+                        "action": None,
+                    }
+                )
+                continue
+            if role not in self._ITEM_ROLES:
+                continue
+            label = self._clean_label(self._name(child))
+            if not label:
+                continue
+            item_path = base_path + [i]
+            submenu = None
+            try:
+                child_count = child.get_child_count()
+            except Exception:  # noqa: BLE001
+                child_count = 0
+            for j in range(child_count):
+                try:
+                    sub = child.get_child_at_index(j)
+                except Exception:  # noqa: BLE001
+                    continue
+                if sub is not None and self._role(sub) in ("ATSPI_ROLE_MENU", "ATSPI_ROLE_POPUP_MENU"):
+                    submenu = sub
+                    break
+            if submenu is not None:
+                items_out.append(
+                    {
+                        "id": self.nid(prefix),
+                        "label": label,
+                        "type": "menu",
+                        "enabled": self._enabled(child),
+                        "icon": "",
+                        "checkState": self._checkstate(child),
+                        "action": None,
+                        "items": self._extract_children(submenu, prefix, item_path + [j], depth + 1),
+                    }
+                )
+                continue
+            items_out.append(
+                {
+                    "id": self.nid(prefix),
+                    "label": label,
+                    "type": "item",
+                    "enabled": self._enabled(child),
+                    "icon": "",
+                    "checkState": self._checkstate(child),
+                    "action": {"kind": "atspi", "app": self.found[0].get_name() or "", "pid": self.pid, "index": item_path},
+                }
+            )
+        return items_out
+
+    def build(self):
+        if not self.discover():
+            return None
+        _, menubar = self.found
+        base_path = self._menubar_path(menubar)
+        return self._extract_children(menubar, "atspi", base_path)
+
+
+def _extract_atspi(pid, app_name, address):
+    try:
+        extractor = AtspiMenuExtractor(pid, app_name, address)
+        menubar = extractor.build()
+        return menubar, extractor.found
+    except Exception as exc:  # noqa: BLE001
+        log(f"AT-SPI extraction failed: {exc}")
+        return None, None
+
+
+def normalize_menus(menubar):
+    """Collapse redundant separators in an extracted menu tree.
+
+    Toolkits collapse them when they lay out a native menu: a separator that
+    directly follows another one is given no geometry, so the app shows a
+    single line. The accessibility tree still lists both actions, and the bar
+    draws one row per action, which would show a double gap the app itself
+    never renders.
+
+    Two ways to end up with a redundant separator: the app adds one twice,
+    or it hides an action that sat between two of them (Qt drops hidden
+    actions from the tree but keeps the separators). Both look the same here,
+    so drop any separator that directly follows another one.
+    """
+    for menu in menubar or []:
+        items = menu.get("items")
+        if not items:
+            continue
+        collapsed = []
+        for item in items:
+            if item.get("type") == "separator" and collapsed and collapsed[-1].get("type") == "separator":
+                continue
+            collapsed.append(item)
+        menu["items"] = collapsed
+        normalize_menus([item for item in collapsed if item.get("type") == "menu"])
+    return menubar
+
+
+class SnapshotBuilder:
+    def __init__(self, win):
+        self.win = win
+        self.app_id = win.get("initialClass") or win.get("class") or ""
+        self.title = win.get("title") or ""
+        self.address = win.get("address") or ""
+        self.pid = win.get("pid") or 0
+        self.counter = 0
+        self.desktop = parse_desktop(find_desktop_file(self.app_id)) if self.app_id else None
+        self.app_name = (self.desktop or {}).get("name") or self.app_id or "Desktop"
+        self.icon = (self.desktop or {}).get("icon") or ""
+        self.app_exec = clean_exec((self.desktop or {}).get("exec") or "")
+
+    def nid(self, prefix):
+        self.counter += 1
+        return f"{prefix}.{self.counter}"
+
+    def item(self, menu_prefix, label, action=None, enabled=True, icon="", check="none"):
+        return {
+            "id": self.nid(menu_prefix),
+            "label": label,
+            "type": "item",
+            "enabled": enabled,
+            "icon": icon,
+            "checkState": check,
+            "action": action,
+        }
+
+    def separator(self, menu_prefix):
+        return {"id": self.nid(menu_prefix), "label": "", "type": "separator", "enabled": False, "icon": "", "checkState": "none", "action": None}
+
+    def hypr(self, lua_expr):
+        # Lua dispatcher expression for this Hyprland (0.55+ lua config API),
+        # e.g. 'hl.dsp.window.float({ action = "toggle" })'.
+        return {"kind": "hypr", "lua": lua_expr}
+
+    def exec_cmd(self, command):
+        return {"kind": "exec", "command": command}
+
+    def app_menu(self):
+        prefix = "app"
+        items = []
+        if self.app_exec:
+            items.append(self.item(prefix, f"Launch {self.app_name}", self.exec_cmd(self.app_exec)))
+        for action in (self.desktop or {}).get("actions", []):
+            items.append(self.item(prefix, action["name"], self.exec_cmd(clean_exec(action["exec"])), icon=action["icon"]))
+        if items:
+            items.append(self.separator(prefix))
+        items.append(self.item(prefix, "Close Window", self.hypr(f'hl.dsp.window.close({{ window = "address:{self.address}" }})')))
+        items.append(self.item(prefix, "Quit", self.hypr(f'hl.dsp.window.kill({{ window = "address:{self.address}" }})')))
+        return {"id": "app", "label": self.app_name, "type": "menu", "items": items}
+
+    def file_menu(self):
+        prefix = "file"
+        items = []
+        if self.app_exec:
+            items.append(self.item(prefix, "New Window", self.exec_cmd(self.app_exec)))
+            items.append(self.separator(prefix))
+        items.append(self.item(prefix, "Close Window", self.hypr(f'hl.dsp.window.close({{ window = "address:{self.address}" }})')))
+        items.append(self.item(prefix, "Quit Application", self.hypr(f'hl.dsp.window.kill({{ window = "address:{self.address}" }})')))
+        return {"id": "file", "label": "File", "type": "menu", "items": items}
+
+    def edit_menu(self):
+        return {"id": "edit", "label": "Edit", "type": "menu", "items": [
+            self.item("edit", "Copy", None, enabled=False),
+            self.item("edit", "Paste", None, enabled=False),
+        ]}
+
+    def view_menu(self):
+        prefix = "view"
+        return {"id": "view", "label": "View", "type": "menu", "items": [
+            self.item(prefix, "Toggle Floating", self.hypr('hl.dsp.window.float({ action = "toggle" })')),
+            self.item(prefix, "Toggle Fullscreen", self.hypr('hl.dsp.window.fullscreen({ mode = "fullscreen", action = "toggle" })')),
+        ]}
+
+    def window_menu(self):
+        prefix = "window"
+        return {"id": "window", "label": "Window", "type": "menu", "items": [
+            self.item(prefix, "Next Workspace", self.hypr('hl.dsp.focus({ workspace = "e+1" })')),
+            self.item(prefix, "Previous Workspace", self.hypr('hl.dsp.focus({ workspace = "e-1" })')),
+            self.separator(prefix),
+            self.item(prefix, "Move Left", self.hypr('hl.dsp.window.move({ direction = "l" })')),
+            self.item(prefix, "Move Right", self.hypr('hl.dsp.window.move({ direction = "r" })')),
+            self.item(prefix, "Move Up", self.hypr('hl.dsp.window.move({ direction = "u" })')),
+            self.item(prefix, "Move Down", self.hypr('hl.dsp.window.move({ direction = "d" })')),
+            self.separator(prefix),
+            self.item(prefix, "Send to Scratchpad", self.hypr('hl.dsp.window.move({ workspace = "special:scratchpad", follow = true })')),
+        ]}
+
+    def help_menu(self):
+        prefix = "help"
+        return {"id": "help", "label": "Help", "type": "menu", "items": [
+            self.item(prefix, "Launch Terminal", self.exec_cmd("xdg-terminal-exec")),
+        ]}
+
+    def omarchy_menu(self):
+        """Default 'Omarchy' app menu shown when no app window is focused,
+        mirroring macOS where the Finder menu always fills the bar.
+        Label/icon come from ~/.config/omarchy/global-menu.json when set."""
+        cfg = load_menu_config()
+        prefix = "omarchy"
+        items = [
+            self.item(prefix, f"About {cfg['name']}", self.exec_cmd("omarchy-launch-about")),
+            self.separator(prefix),
+            self.item(prefix, "Launch Terminal", self.exec_cmd("xdg-terminal-exec")),
+            self.item(prefix, "Capture Screenshot", self.exec_cmd("omarchy-capture-screenshot")),
+            self.separator(prefix),
+            self.item(prefix, "Lock Screen", self.exec_cmd("omarchy-system-lock")),
+            self.item(prefix, "Logout", self.exec_cmd("omarchy-system-logout")),
+            self.separator(prefix),
+            self.item(prefix, "Reboot", self.exec_cmd("omarchy-system-reboot")),
+            self.item(prefix, "Shutdown", self.exec_cmd("omarchy-system-shutdown")),
+        ]
+        return {"id": prefix, "label": cfg["name"], "type": "menu", "items": items}
+
+    def obs_file_menu(self):
+        prefix = "obs_file"
+        return {
+            "id": prefix,
+            "label": "File",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "Settings", self.exec_cmd("obs --settings")),
+                self.separator(prefix),
+                self.item(prefix, "Close Window", self.hypr(f'hl.dsp.window.close({{ window = "address:{self.address}" }})')),
+                self.item(prefix, "Exit", self.hypr(f'hl.dsp.window.kill({{ window = "address:{self.address}" }})')),
+            ],
+        }
+
+    def obs_edit_menu(self):
+        prefix = "obs_edit"
+        return {
+            "id": prefix,
+            "label": "Edit",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "Undo", None, enabled=False),
+                self.item(prefix, "Redo", None, enabled=False),
+                self.separator(prefix),
+                self.item(prefix, "Cut", None, enabled=False),
+                self.item(prefix, "Copy", None, enabled=False),
+                self.item(prefix, "Paste", None, enabled=False),
+                self.separator(prefix),
+                self.item(prefix, "Lock Preview", None, enabled=True),
+            ],
+        }
+
+    def obs_view_menu(self):
+        prefix = "obs_view"
+        return {
+            "id": prefix,
+            "label": "View",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "Toggle Fullscreen", self.hypr('hl.dsp.window.fullscreen({ mode = "fullscreen", action = "toggle" })')),
+            ],
+        }
+
+    def obs_docks_menu(self):
+        prefix = "obs_docks"
+        return {
+            "id": prefix,
+            "label": "Docks",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "Audio Mixer", None, enabled=True),
+                self.item(prefix, "Controls", None, enabled=True),
+                self.item(prefix, "Scene Transitions", None, enabled=True),
+                self.item(prefix, "Scenes", None, enabled=True),
+                self.item(prefix, "Sources", None, enabled=True),
+            ],
+        }
+
+    def obs_profile_menu(self):
+        prefix = "obs_profile"
+        return {
+            "id": prefix,
+            "label": "Profile",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "New", None, enabled=True),
+                self.item(prefix, "Duplicate", None, enabled=True),
+                self.item(prefix, "Rename", None, enabled=True),
+                self.item(prefix, "Remove", None, enabled=True),
+            ],
+        }
+
+    def obs_scene_collection_menu(self):
+        prefix = "obs_sc"
+        return {
+            "id": prefix,
+            "label": "Scene Collection",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "New", None, enabled=True),
+                self.item(prefix, "Duplicate", None, enabled=True),
+                self.item(prefix, "Rename", None, enabled=True),
+                self.item(prefix, "Remove", None, enabled=True),
+            ],
+        }
+
+    def obs_tools_menu(self):
+        prefix = "obs_tools"
+        return {
+            "id": prefix,
+            "label": "Tools",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "Auto-Configuration Wizard", None, enabled=True),
+                self.item(prefix, "Scripts", None, enabled=True),
+            ],
+        }
+
+    def obs_help_menu(self):
+        prefix = "obs_help"
+        return {
+            "id": prefix,
+            "label": "Help",
+            "type": "menu",
+            "items": [
+                self.item(prefix, "Check for Updates", None, enabled=True),
+                self.item(prefix, "Log Files", None, enabled=True),
+                self.separator(prefix),
+                self.item(prefix, "About OBS Studio", self.exec_cmd("omarchy-launch-about")),
+            ],
+        }
+
+
+    def build(self):
+        base = {
+            "appId": self.app_id,
+            "appName": self.app_name,
+            "icon": self.icon,
+            "title": self.title,
+        }
+        if not self.app_id:
+            cfg = load_menu_config()
+            base.update(
+                {
+                    "appName": cfg["name"],
+                    "icon": cfg["icon"],
+                    "title": "",
+                    "source": "none",
+                    "menubar": [self.omarchy_menu()],
+                }
+            )
+            return base
+
+        app_id_lower = self.app_id.lower()
+        if "steam" in app_id_lower:
+            base["source"] = "desktop-fallback"
+            base["menubar"] = [
+                self.app_menu(),
+                self.file_menu(),
+                self.edit_menu(),
+                self.view_menu(),
+                self.window_menu(),
+                self.help_menu(),
+            ]
+            return base
+
+        if "firefox" in app_id_lower or "librewolf" in app_id_lower:
+            base["source"] = "desktop-fallback"
+            base["menubar"] = [
+                self.app_menu(),
+                self.file_menu(),
+                self.edit_menu(),
+                self.view_menu(),
+                self.window_menu(),
+                self.help_menu(),
+            ]
+            return base
+
+        if ("obs" in app_id_lower and "obsidian" not in app_id_lower) or ("studio" in app_id_lower and "obsidian" not in app_id_lower):
+            base["source"] = "curated-fallback"
+            base["menubar"] = [
+                self.obs_file_menu(),
+                self.obs_edit_menu(),
+                self.obs_view_menu(),
+                self.obs_docks_menu(),
+                self.obs_profile_menu(),
+                self.obs_scene_collection_menu(),
+                self.obs_tools_menu(),
+                self.obs_help_menu(),
+            ]
+            return base
+
+        if not check_negative_cache(self.pid, "org.gtk.Menus"):
+            gtk_menubar, found = _extract_gtk_menubar(self.pid, self.app_name, self.address)
+            if gtk_menubar:
+                clear_negative_cache(self.pid, "org.gtk.Menus")
+                base.update(
+                    {
+                        "source": "org.gtk.Menus",
+                        "dbus": {"name": found[0], "app": found[1]},
+                        "menubar": normalize_menus(gtk_menubar),
+                    }
+                )
+                return base
+            else:
+                mark_negative_cache(self.pid, "org.gtk.Menus")
+
+        if not check_negative_cache(self.pid, "dbusmenu"):
+            dbusmenu, found = _extract_dbusmenu(self.pid, self.app_name, self.address)
+            if dbusmenu:
+                clear_negative_cache(self.pid, "dbusmenu")
+                base.update(
+                    {
+                        "source": "dbusmenu",
+                        "dbus": {"name": found[0], "path": found[1]},
+                        "menubar": normalize_menus(dbusmenu),
+                    }
+                )
+                return base
+            else:
+                mark_negative_cache(self.pid, "dbusmenu")
+
+        if not check_negative_cache(self.pid, "at-spi"):
+            atspi, _ = _extract_atspi(self.pid, self.app_name, self.address)
+            if atspi:
+                clear_negative_cache(self.pid, "at-spi")
+                base.update({"source": "at-spi", "menubar": normalize_menus(atspi)})
+                return base
+            else:
+                mark_negative_cache(self.pid, "at-spi")
+
+        base["source"] = "desktop-fallback"
+        base["menubar"] = [
+            self.app_menu(),
+            self.file_menu(),
+            self.edit_menu(),
+            self.view_menu(),
+            self.window_menu(),
+            self.help_menu(),
+        ]
+        return base
+
+
+def write_snapshot(snapshot):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ACTIVE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, ACTIVE_FILE)
+
+
+def load_item_map(snapshot):
+    mapping = {}
+
+    def walk(menu, parent_id=""):
+        for item in menu.get("items", []):
+            mapping[item["id"]] = item
+            if item.get("type") == "menu":
+                walk(item, item["id"])
+
+    for menu in snapshot.get("menubar", []):
+        mapping[menu["id"]] = menu
+        walk(menu, menu["id"])
+    return mapping
+
+
+def execute_action(action):
+    if not action:
+        return False
+    kind = action.get("kind")
+    if kind == "hypr":
+        expr = action.get("lua") or ""
+        if not expr:
+            return False
+        run_hyprctl(["dispatch", expr])
+        return True
+    if kind == "exec":
+        command = action.get("command") or ""
+        if not command:
+            return False
+        subprocess.Popen(["sh", "-c", command], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    if kind == "gtk-action":
+        return _execute_gtk_action(action)
+    if kind == "dbusmenu-event":
+        return _execute_dbusmenu_event(action)
+    if kind == "atspi":
+        return _execute_atspi_action(action)
+    log(f"unknown action kind: {kind}")
+    return False
+
+
+def _execute_gtk_action(action):
+    """Fire a GTK action via org.freedesktop.Application.ActivateAction."""
+    Gio, GLib = _gio_import()
+    try:
+        conn = _bus()
+        params = []
+        target = action.get("target")
+        if target:
+            variant = GLib.Variant.new_from_bytes(
+                GLib.VariantType.new(target["type"]),
+                GLib.Bytes.new(base64.b64decode(target["data"])),
+            )
+            params.append(variant)
+        conn.call_sync(
+            action.get("bus"),
+            action.get("path"),
+            "org.freedesktop.Application",
+            "ActivateAction",
+            GLib.Variant("(sava{sv})", (action.get("action", ""), params, {})),
+            None,
+            Gio.DBusCallFlags.NONE,
+            5000,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"gtk-action failed: {exc}")
+        return False
+
+
+def _execute_dbusmenu_event(action):
+    """Fire a DBusMenu item via Event(id, 'clicked', data, timestamp)."""
+    Gio, GLib = _gio_import()
+    try:
+        conn = _bus()
+        reply = conn.call_sync(
+            action.get("bus"),
+            action.get("path"),
+            "com.canonical.dbusmenu",
+            "Event",
+            GLib.Variant("(isvu)", (action.get("id"), "clicked", GLib.Variant("s", ""), 0)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            5000,
+        )
+        handled = reply.unpack()[0]
+        log(f"dbusmenu Event({action.get('id')}, clicked) handled={handled}")
+        return bool(handled)
+    except Exception as exc:  # noqa: BLE001
+        log(f"dbusmenu-event failed: {exc}")
+        return False
+
+
+def _execute_atspi_action(action):
+    """Invoke an AT-SPI menu item by re-resolving its child-index path."""
+    Atspi = _atspi_import()
+    app_name = action.get("app") or ""
+    pid = action.get("pid") or 0
+    index_path = action.get("index") or []
+    if not index_path:
+        return False
+    try:
+        desktop = Atspi.get_desktop(0)
+        count = desktop.get_child_count()
+        candidates = []
+        for i in range(count):
+            try:
+                app = desktop.get_child_at_index(i)
+            except Exception:  # noqa: BLE001
+                continue
+            if app is None:
+                continue
+            if pid and (app.get_process_id() or 0) == pid:
+                candidates.append(app)
+            elif not pid and (app.get_name() or "") == app_name:
+                candidates.append(app)
+        if not candidates:
+            log("atspi: app not found in AT-SPI desktop")
+            return False
+        for target_app in candidates:
+            acc = target_app
+            ok = True
+            for idx in index_path:
+                try:
+                    acc = acc.get_child_at_index(idx)
+                except Exception:  # noqa: BLE001
+                    ok = False
+                    break
+                if acc is None:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            n = acc.get_n_actions()
+            if n < 1:
+                log(f"atspi: item '{acc.get_name() or ''}' has no actions")
+                return False
+            acc.do_action(0)
+            log(f"atspi: do_action(0) on '{acc.get_name() or ''}'")
+            return True
+        log("atspi: index path did not resolve in any matching app")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log(f"atspi-action failed: {exc}")
+        return False
+
+
+def handle_requests(item_map):
+    if not REQUEST_FILE.is_file():
+        return
+    try:
+        data = json.loads(REQUEST_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"bad request: {exc}")
+        try:
+            REQUEST_FILE.unlink()
+        except OSError:
+            pass
+        return
+    try:
+        REQUEST_FILE.unlink()
+    except OSError:
+        pass
+    if not isinstance(data, dict):
+        return
+    action = data.get("action")
+    if isinstance(action, dict):
+        execute_action(action)
+        return
+    item_id = data.get("id")
+    if not item_id:
+        return
+    item = item_map.get(item_id)
+    if item is None:
+        log(f"unknown item id: {item_id}")
+        return
+    execute_action(item.get("action"))
+
+
+def connect_events():
+    instance = hypr_instance_dir()
+    if not instance:
+        return None
+    path = instance / ".socket2.sock"
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(path))
+        sock.setblocking(False)
+        return sock
+    except OSError as exc:
+        log(f"connect {path}: {exc}")
+        return None
+
+
+class MenuChangeWatcher:
+    """Subscribes to the focused app's menu-change signals.
+
+    org.gtk.Menus apps emit Changed(au) when their menu structure updates;
+    DBusMenu apps emit LayoutUpdated(ia{sv}) similarly. While the user keeps
+    the same window focused, these fire when items toggle or appear, so the
+    daemon can refresh the snapshot without waiting for a focus change.
+    """
+
+    def __init__(self):
+        self.subscription = 0
+        self.conn = None
+        self.on_change = None
+
+    def _signal_cb(self, conn, sender, obj_path, iface, signal, params, user_data):
+        log(f"menu change signal: {signal}")
+        cb = self.on_change
+        if cb:
+            cb()
+
+    def watch(self, snapshot, on_change):
+        self.clear()
+        source = snapshot.get("source")
+        dbus = snapshot.get("dbus") or {}
+        name = dbus.get("name")
+        if source == "org.gtk.Menus" and name:
+            path = str(dbus.get("app") or "").rstrip("/") + "/menus/menubar"
+            interface, member = "org.gtk.Menus", "Changed"
+        elif source == "dbusmenu" and name:
+            path = str(dbus.get("path") or "")
+            interface, member = "com.canonical.dbusmenu", "LayoutUpdated"
+        else:
+            return
+        if not path:
+            return
+        Gio, _ = _gio_import()
+        self.conn = _bus()
+        self.on_change = on_change
+        try:
+            self.subscription = self.conn.signal_subscribe(
+                name,
+                interface,
+                member,
+                path,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._signal_cb,
+                None,
+            )
+            log(f"watching {interface}.{member} on {name} {path}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"signal subscribe failed: {exc}")
+            self.subscription = 0
+            self.conn = None
+            self.on_change = None
+
+    def clear(self):
+        if self.subscription and self.conn is not None:
+            try:
+                self.conn.signal_unsubscribe(self.subscription)
+            except Exception:  # noqa: BLE001
+                pass
+        self.subscription = 0
+        self.conn = None
+        self.on_change = None
+
+
+def run_once():
+    snapshot = SnapshotBuilder(active_window()).build()
+    write_snapshot(snapshot)
+    log(f"wrote snapshot for '{snapshot['appName']}' (source={snapshot['source']})")
+
+
+def run_daemon():
+    global DEBUG  # noqa: F811
+    initial_window = active_window()
+    snapshot = SnapshotBuilder(initial_window).build()
+    write_snapshot(snapshot)
+    item_map = load_item_map(snapshot)
+    watcher = MenuChangeWatcher()
+    watcher.watch(snapshot, lambda: refresh_on_menu_change())
+    last_window_key = (initial_window.get("address"), initial_window.get("pid"), initial_window.get("class"))
+
+    sock = connect_events()
+    buffer = ""
+    last_request_mtime = 0.0
+    refresh_pending = False
+
+    # Make apps publish their accessible menus. Without an AT-SPI event
+    # listener registered, at-spi2-core >= 2.62 reports accessibility as
+    # disabled, Qt apps keep their AT-SPI bridge off and export an empty
+    # tree, and menu extraction falls back to the synthetic desktop menu.
+    enable_atspi()
+    force_a11y_enabled()
+    last_a11y_check = time.monotonic()
+
+    def refresh_for(window):
+        nonlocal snapshot, item_map, refresh_pending
+        refresh_pending = False
+        snapshot = SnapshotBuilder(window).build()
+        write_snapshot(snapshot)
+        item_map = load_item_map(snapshot)
+        watcher.watch(snapshot, lambda: refresh_on_menu_change())
+        log(f"refreshed '{snapshot['appName']}' (source={snapshot['source']})")
+
+    def refresh_on_menu_change():
+        nonlocal refresh_pending
+        if refresh_pending:
+            return
+        refresh_pending = True
+
+    while True:
+        refreshed = False
+
+        # Keep the AT-SPI registration alive: the a11y bus (or the launcher
+        # that tracks it) can be restarted under us, and IsEnabled would
+        # silently drop back to false, taking every app's menus with it.
+        now = time.monotonic()
+        if now - last_a11y_check > 5:
+            last_a11y_check = now
+            if not enable_atspi(force=True):
+                force_a11y_enabled()
+
+        if refresh_pending:
+            window = active_window()
+            if is_shell_window(window):
+                refresh_pending = False
+            else:
+                win_key = (window.get("address"), window.get("pid"), window.get("class"))
+                last_window_key = win_key
+                refresh_for(window)
+        if sock is None:
+            sock = connect_events()
+            time.sleep(1)
+            continue
+
+        try:
+            ready, _, _ = select.select([sock], [], [], 0.05)
+        except (OSError, ValueError):
+            sock = connect_events()
+            continue
+
+        if ready:
+            try:
+                data = sock.recv(65536)
+            except (BlockingIOError, OSError):
+                data = b""
+            if not data:
+                sock.close()
+                sock = connect_events()
+                continue
+            buffer += data.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("activewindow>>"):
+                    refreshed = True
+
+        try:
+            request_mtime = REQUEST_FILE.stat().st_mtime if REQUEST_FILE.exists() else 0.0
+        except OSError:
+            request_mtime = 0.0
+        if request_mtime and request_mtime != last_request_mtime:
+            last_request_mtime = request_mtime
+            handle_requests(item_map)
+
+        if refreshed:
+            window = active_window()
+            if is_shell_window(window):
+                log(f"focus -> shell window, keeping '{snapshot['appName']}' menu")
+            else:
+                win_key = (window.get("address"), window.get("pid"), window.get("class"))
+                if win_key == last_window_key and not refresh_pending:
+                    pass
+                else:
+                    last_window_key = win_key
+                    refresh_for(window)
+
+        # Dispatch pending GIO/D-Bus signal callbacks (menu-change signals).
+        # call_sync blocks on the main context, but signal delivery only
+        # happens when we iterate it, so drain it every pass.
+        Gio, GLib = _gio_import()
+        for _ in range(8):
+            if not GLib.MainContext.default().iteration(False):
+                break
+
+
+def main(argv=None):
+    global DEBUG  # noqa: F811
+    parser = argparse.ArgumentParser(description="Publish the focused window's menu for the omarchy bar.")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("run", help="run the bridge daemon (default)")
+    activate = sub.add_parser("activate", help="request the daemon trigger a menu item")
+    activate.add_argument("item_id", nargs="?", help="menu item id from active.json (legacy)")
+    activate.add_argument("--action-json", default=None, help="full action object to execute (preferred)")
+    parser.add_argument("--once", action="store_true", help="write one snapshot and exit")
+    parser.add_argument("--debug", action="store_true", help="verbose stderr logging")
+
+    args = parser.parse_args(argv)
+    DEBUG = args.debug
+
+    if args.command == "activate":
+        payload = {}
+        if args.action_json:
+            try:
+                payload["action"] = json.loads(args.action_json)
+            except json.JSONDecodeError as exc:
+                log(f"activate: bad action json: {exc}")
+                return 1
+        elif args.item_id:
+            payload["id"] = args.item_id
+        if not payload:
+            log("activate: nothing to do")
+            return 1
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = REQUEST_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, REQUEST_FILE)
+        return 0
+
+    if args.once:
+        run_once()
+        return 0
+
+    run_daemon()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

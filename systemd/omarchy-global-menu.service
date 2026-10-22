@@ -1,0 +1,13 @@
+[Unit]
+Description=Omarchy global menu bridge (focused-app menus for the bar)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.config/omarchy/plugins/primo.global-menu/bin/omarchy-global-menu-bridge
+Restart=on-failure
+RestartSec=2
+Type=simple
+
+[Install]
+WantedBy=graphical-session.target
