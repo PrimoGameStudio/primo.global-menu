@@ -1,5 +1,7 @@
 # primo.global-menu
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/A3D729DKXZ)
+
 A macOS-style application menu bar for Omarchy. The bar shows the focused
 window's own menu (File / Edit / View / …) and lets you trigger its items
 with the mouse.
