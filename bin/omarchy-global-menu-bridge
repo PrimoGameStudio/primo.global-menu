@@ -1669,11 +1669,47 @@ class SnapshotBuilder:
         return base
 
 
-def write_snapshot(snapshot):
+def ensure_private_state():
+    """Make the state directory and any existing state files private.
+
+    With a default umask of 022, Path.mkdir/write_text would leave
+    ~/.local/state/omarchy/global-menu at 0755 and active.json at 0644,
+    readable by any other local UID. Keep them at 0700/0600 instead, and
+    repair files written by earlier (insecure) runs.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = ACTIVE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, ACTIVE_FILE)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+    for path in (ACTIVE_FILE, REQUEST_FILE):
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+            if mode & 0o077:
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def write_private_text(path, text):
+    """Write text to path via a temp file, keeping the result mode 0600."""
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+
+
+def write_snapshot(snapshot):
+    ensure_private_state()
+    write_private_text(ACTIVE_FILE, json.dumps(snapshot, ensure_ascii=False))
 
 
 def load_item_map(snapshot):
@@ -2072,6 +2108,10 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     DEBUG = args.debug
+    # Defense in depth: every file this process (and its children) creates is
+    # owner-only by default, so even a future code path that forgets an explicit
+    # mode still lands at 0600 instead of 0644 under a 022 umask.
+    os.umask(0o077)
 
     if args.command == "activate":
         payload = {}
@@ -2086,10 +2126,8 @@ def main(argv=None):
         if not payload:
             log("activate: nothing to do")
             return 1
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = REQUEST_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, REQUEST_FILE)
+        ensure_private_state()
+        write_private_text(REQUEST_FILE, json.dumps(payload))
         return 0
 
     if args.once:

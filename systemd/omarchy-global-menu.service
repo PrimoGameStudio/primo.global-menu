@@ -8,6 +8,8 @@ ExecStart=%h/.config/omarchy/plugins/primo.global-menu/bin/omarchy-global-menu-b
 Restart=on-failure
 RestartSec=2
 Type=simple
+# Keep state files (active.json/request.json) private even under a 022 umask.
+UMask=077
 
 [Install]
 WantedBy=graphical-session.target
