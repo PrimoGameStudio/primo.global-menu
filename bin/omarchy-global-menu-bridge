@@ -1689,15 +1689,58 @@ def ensure_private_state():
                 os.chmod(path, 0o600)
         except OSError:
             pass
+    # Drop leftover temp files from earlier (insecure) runs so a world-readable
+    # active.tmp/request.tmp left behind by an interrupted write cannot linger
+    # after the upgrade.
+    try:
+        for leftover in STATE_DIR.glob("*.tmp"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _open_private_temp(path):
+    """Open a fresh, private temp file next to path with exclusive creation.
+
+    O_EXCL guarantees we never truncate and reuse an existing inode: a leftover
+    temp from a crashed earlier run (possibly still world-readable) causes
+    FileExistsError and we move on to a new unique name. The created mode is
+    0600, which a umask of 022/077 cannot widen to group/other.
+    """
+    pid = os.getpid()
+    last_exc = None
+    for attempt in range(10000):
+        tmp = path.with_name(f".{path.name}.{pid}.{attempt}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            last_exc = exc
+            continue
+        except OSError as exc:
+            last_exc = exc
+            continue
+        return fd, tmp
+    raise last_exc or OSError(f"could not create a private temp file next to {path}")
 
 
 def write_private_text(path, text):
-    """Write text to path via a temp file, keeping the result mode 0600."""
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Write text to path via a fresh private temp file, then atomically replace.
+
+    The temp file is created with O_CREAT|O_EXCL so an inode left behind by an
+    interrupted earlier write is never truncated and reused (which would
+    preserve its old, possibly world-readable, mode). The temp is written at
+    0600, fsynced, and moved onto path with os.replace(), so readers never see
+    a partial write and the replacement inherits the private mode.
+    """
+    fd, tmp = _open_private_temp(path)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
     except BaseException:
         try:
             os.unlink(tmp)
