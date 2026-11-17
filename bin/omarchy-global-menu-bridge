@@ -207,6 +207,19 @@ def find_desktop_file(app_id):
             return exact
         for desktop in base.glob("*.desktop"):
             candidates.append(desktop)
+    # Some apps put a human name in the WM class (Electron often does:
+    # "GitHub Desktop" for github-desktop.desktop), so a literal lookup misses
+    # and the app ends up with no icon and its WM class as its name. Try the
+    # desktop-file spelling too: lowercased, spaces as hyphens.
+    aliases = [app_id.lower(), app_id.lower().replace(" ", "-")]
+    for alias in aliases:
+        if alias == app_id:
+            continue
+        for base in DESKTOP_DIRS:
+            exact = base / f"{alias}.desktop"
+            if exact.is_file():
+                _DESKTOP_CACHE[app_id] = exact
+                return exact
     app_id_l = app_id.lower()
     best = None
     best_score = -1
