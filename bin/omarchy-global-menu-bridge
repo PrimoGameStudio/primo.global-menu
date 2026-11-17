@@ -213,9 +213,13 @@ def find_desktop_file(app_id):
     for desktop in candidates:
         stem = desktop.stem.lower()
         score = 0
-        if stem in app_id_l:
+        # Short stems are meaningless as substrings: a one-letter X.desktop
+        # ("X") is "in" every app id that contains an x, so any unmatched WM
+        # class resolved to it. Require a stem long enough to identify
+        # something.
+        if len(stem) >= 3 and stem in app_id_l:
             score = 10 + len(stem)
-        elif app_id_l in stem:
+        elif len(app_id_l) >= 3 and app_id_l in stem:
             score = 5
         try:
             parser = configparser.ConfigParser(interpolation=None, strict=False)
@@ -228,11 +232,19 @@ def find_desktop_file(app_id):
         if score > best_score:
             best = desktop
             best_score = score
+    # A score of 0 means nothing matched: every candidate merely failed to
+    # disagree. Returning one anyway names the app after whichever desktop
+    # file the directory listing happened to show first (soffice -> Basecamp),
+    # so report no match and let the caller fall back to the WM class.
+    if best_score <= 0:
+        best = None
     _DESKTOP_CACHE[app_id] = best
     return best
 
 
 def parse_desktop(path):
+    if not path:
+        return None
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     try:
         parser.read(path)
@@ -1246,18 +1258,41 @@ class AtspiMenuExtractor:
                 continue
             item_path = base_path + [i]
             submenu = None
+            submenu_path = item_path
             try:
                 child_count = child.get_child_count()
             except Exception:  # noqa: BLE001
                 child_count = 0
-            for j in range(child_count):
-                try:
-                    sub = child.get_child_at_index(j)
-                except Exception:  # noqa: BLE001
-                    continue
-                if sub is not None and self._role(sub) in ("ATSPI_ROLE_MENU", "ATSPI_ROLE_POPUP_MENU"):
-                    submenu = sub
-                    break
+            if role == "ATSPI_ROLE_MENU":
+                # A menubar entry that is itself a menu: LibreOffice hangs the
+                # dropdown's items straight off it, while GTK wraps them in a
+                # single POPUP_MENU child. Use the popup when there is one,
+                # otherwise the entry is the container.
+                popup = None
+                for j in range(child_count):
+                    try:
+                        sub = child.get_child_at_index(j)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if sub is not None and self._role(sub) == "ATSPI_ROLE_POPUP_MENU":
+                        popup = sub
+                        submenu_path = item_path + [j]
+                        break
+                # Never adopt a plain MENU child: inside a dropdown that is a
+                # submenu (LibreOffice's File > New), and adopting it rendered
+                # its items as the whole menu and left entries whose children
+                # are all plain items (Styles, Window, Help) submenu-less.
+                submenu = popup if popup is not None else (child if child_count > 0 else None)
+            else:
+                for j in range(child_count):
+                    try:
+                        sub = child.get_child_at_index(j)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if sub is not None and self._role(sub) in ("ATSPI_ROLE_MENU", "ATSPI_ROLE_POPUP_MENU"):
+                        submenu = sub
+                        submenu_path = item_path + [j]
+                        break
             if submenu is not None:
                 items_out.append(
                     {
@@ -1268,7 +1303,7 @@ class AtspiMenuExtractor:
                         "icon": "",
                         "checkState": self._checkstate(child),
                         "action": None,
-                        "items": self._extract_children(submenu, prefix, item_path + [j], depth + 1),
+                        "items": self._extract_children(submenu, prefix, submenu_path, depth + 1),
                     }
                 )
                 continue
