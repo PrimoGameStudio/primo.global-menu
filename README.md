@@ -47,10 +47,70 @@ The daemon walks a cascade for the focused window and uses the first hit:
 | `org.gtk.Menus` | GTK3's exported menubar model                    |
 | `dbusmenu`      | `com.canonical.dbusmenu` (KDE/Electron apps)     |
 | `at-spi`        | the accessibility tree (Qt, GTK4, Electron)      |
+| `harvest`       | title-bar popovers, opened to be read (opt-in)   |
 | `desktop-fallback` | `.desktop` actions + window operations        |
 
 `desktop-fallback` is the generic App/File/Edit/View/Window/Help menu. Seeing
 it for an app that *does* have a menu bar means the extraction failed.
+
+A `dbusmenu` root is only accepted as a menubar when most of its entries are
+submenus. Some apps export a flat menu at `/MenuBar` — OBS publishes its tray
+menu there — and rendering that as a menubar would show `Hide`, `Start
+Streaming` and `Exit` as if they were File and Edit.
+
+## The AppMenu.Registrar
+
+The daemon serves `com.canonical.AppMenu.Registrar` for the whole session.
+Two app classes only export a menu when something is listening for one:
+
+- **Qt6/KDE** registers its window menu with a registrar, or with Plasma's
+  `kded` appmenu module, and exports nothing when neither is present.
+- **LibreOffice** (GTK3 VCL) is a registrar client, and only hides its own
+  menubar once the registrar answers. Without one the app draws its menus and
+  the bar draws them again.
+
+On a Plasma session the registrar is Plasma's. Elsewhere nobody owns the name,
+which is why these apps showed the fallback. If another registrar already owns
+it, the daemon logs that and carries on unchanged: it never displaces one.
+
+Because LibreOffice hides its own menubar through GTK rather than the
+registrar, the setting that actually removes the duplicate is:
+
+```ini
+# ~/.config/gtk-3.0/settings.ini
+[Settings]
+gtk-shell-shows-menubar=1
+```
+
+## Harvesting title-bar menus
+
+Some apps never expose a `MENU_BAR` accessible. Their menubar is a row of
+title-bar buttons, and a dropdown exists only while its button is open: the
+accessibility tree has nothing to read at rest. Zed is one of these.
+
+Set `harvestMenus` to have the daemon open each title-bar entry, read the
+popup, close it again, and publish what it found:
+
+```json
+// ~/.config/omarchy/global-menu.json
+{ "harvestMenus": true }
+```
+
+It is off by default because those popups flash on screen while the snapshot
+is built. Results are memoised per window title, so a focus change does not
+re-flash them.
+
+The strip is found by shape, not by app: a container whose accessible name
+says "title" (never one saying "status", which holds toggle buttons), with at
+least three sibling buttons. The first entry is treated as the application
+menu, and the menubar ends at the first button that opens nothing.
+
+Apps that need it also need accessibility switched on inside the app itself.
+Zed only builds an accessible tree when the experimental adapter is enabled:
+
+```bash
+ZED_EXPERIMENTAL_A11Y=1 zeditor
+```
 
 ## Redundant separators
 
@@ -104,3 +164,16 @@ omarchy-global-menu-bridge activate --action-json '{"kind":"exec","command":"tru
   accessible tree until they are restarted.
 - Applications without a menu bar of their own (terminals, browsers) always
   show the `desktop-fallback` menu.
+- GTK4/libadwaita apps (Nautilus, Papers, Pinta) have no menubar at all, only
+  a hamburger popover. They show `desktop-fallback`; harvesting the popover
+  would present an application menu as if it were File/Edit/View.
+- Electron apps that hide their menu in the frame (GitHub Desktop, Obsidian,
+  LocalSend) export nothing over any of these protocols.
+- Harvesting needs the app's own accessible tree to be switched on, and on a
+  freshly opened window some menubar entries open no popup at all — Zed's
+  `Run`, `Window` and `Help` behave that way until the window has a project
+  open. The harvest ends the menubar at that point rather than inventing
+  entries.
+- While the daemon serves the registrar, apps that registered with it keep a
+  menu only as long as it runs. It restarts on failure, and it never takes the
+  name from a registrar that already owns it.
