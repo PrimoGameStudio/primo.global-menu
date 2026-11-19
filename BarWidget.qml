@@ -34,7 +34,9 @@ BarWidget {
   // contract (closeForPopoutSwitch / popoutSwitchClosing) still works.
   readonly property var popoutOwner: ({
     popoutSwitchClosing: false,
-    closeForPopoutSwitch: function() { root.setOpenIndex(-1) }
+    // The bar can call this after the widget is torn down (plugin reload,
+    // monitor unplug), when `root` is already null.
+    closeForPopoutSwitch: function() { if (root) root.setOpenIndex(-1) }
   })
 
   function iconSource(icon) {
@@ -267,8 +269,13 @@ BarWidget {
         var scr = win && win.screen ? win.screen : null
         if (!scr || scr.height <= 0) return 0
         var margin = Style.space(8)
+        // Reserve the bar strip, not the bar window: the bar surface spans the
+        // whole screen (omarchy-bar reports 1920x1080), so subtracting
+        // win.height left the 160px floor and every menu taller than five
+        // rows scrolled inside a stub of a card. barSize is the strip.
         var reserved = 0
-        if (root.bar && (root.bar.position === "top" || root.bar.position === "bottom") && win) reserved += win.height
+        if (root.bar && (root.bar.position === "top" || root.bar.position === "bottom"))
+          reserved += root.bar.barSize
         return Math.max(Style.space(160), scr.height - reserved - margin * 2)
       }
 
