@@ -42,17 +42,23 @@ MENU_CONFIG_FILE = Path(
     os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
 ) / "omarchy" / "global-menu.json"
 
-_MENU_CONFIG_DEFAULTS = {"name": "Omarchy", "icon": "omarchy"}
+_MENU_CONFIG_DEFAULTS = {"name": "Omarchy", "icon": "omarchy", "harvestMenus": False}
 _menu_config_cache = {"mtime": None, "data": dict(_MENU_CONFIG_DEFAULTS)}
 
 
 def load_menu_config():
-    """User overrides for the no-window-focused fallback menu.
+    """User overrides for the fallback menu and the popover harvest.
 
-    Reads ~/.config/omarchy/global-menu.json: {"fallbackName": "...",
-    "fallbackIcon": "..."}. Missing/corrupt file or empty values fall back
-    to defaults. Mtime-cached so each snapshot build re-reads cheaply and
-    edits apply live.
+    Reads ~/.config/omarchy/global-menu.json:
+      {"fallbackName": "...", "fallbackIcon": "...", "harvestMenus": true}
+
+    `harvestMenus` turns on the last-resort path that opens an app's title-bar
+    menus to read them (see PopoverHarvester): it makes menus appear for apps
+    that expose none, at the cost of those popups flashing on screen while the
+    snapshot is built. Off by default.
+
+    Missing/corrupt file or empty values fall back to defaults. Mtime-cached
+    so each snapshot build re-reads cheaply and edits apply live.
     """
     try:
         mtime = MENU_CONFIG_FILE.stat().st_mtime
@@ -70,6 +76,8 @@ def load_menu_config():
                         data["name"] = name
                     if icon:
                         data["icon"] = icon
+                    if "harvestMenus" in parsed:
+                        data["harvestMenus"] = parsed.get("harvestMenus") is True
             except (OSError, json.JSONDecodeError):
                 pass
         _menu_config_cache["mtime"] = mtime
@@ -305,10 +313,24 @@ def clean_exec(exec_line):
 
 
 def clean_menu_label(label):
-    """Strip Tab-separated accelerator/hint suffixes GTK apps embed in labels."""
+    """Strip accelerator hints and mnemonics GTK apps embed in labels.
+
+    Two forms arrive over D-Bus and AT-SPI:
+      - "<label>\t<accel>" hints, where the tab separates the visible text
+        from the shortcut ("Open\tCtrl+O").
+      - "_" mnemonics marking the access key ("_File", "Save _As..."). The
+        underscore is not rendered by a native menubar, so a label carrying it
+        is wrong on the bar (Xournal++ showed "_File", "_Edit", "_Journal").
+
+    A literal "__" is GTK's escape for a real underscore, so it collapses to
+    one and is kept: "Save __As" means the user sees "Save _As".
+    """
     if not label:
         return ""
-    return str(label).split("\t")[0]
+    text = str(label).split("\t")[0]
+    if "__" in text:
+        return text.replace("__", "\0").replace("_", "").replace("\0", "_")
+    return text.replace("_", "")
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +379,7 @@ def _atspi_import():
     return _atspi
 
 
+REGISTRAR = None
 _dbus = None
 
 
@@ -960,6 +983,11 @@ class DbusMenuExtractor:
     def build(self):
         if not self.discover():
             return None
+        return self.build_at(*self.found)
+
+    def build_at(self, name, path):
+        """Build from an explicit (service, object path), no discovery."""
+        self.found = (name, path)
         Gio, _ = _gio_import()
         _, root = self._get_layout()
 
@@ -1031,11 +1059,17 @@ class DbusMenuExtractor:
             return items_out
 
         menubar = []
+        nested = 0
         for child in root[2]:
             cid, cprops, _ = child
             if not cprops.get("visible", True):
                 continue
             label = clean_menu_label(str(cprops.get("label") or ""))
+            if not label and not cprops.get("children-display"):
+                # A separator at the root belongs to a flat menu, not a menubar.
+                continue
+            if cprops.get("children-display"):
+                nested += 1
             menubar.append(
                 {
                     "id": self.nid("dbm"),
@@ -1048,6 +1082,16 @@ class DbusMenuExtractor:
                     "items": build_menu(child),
                 }
             )
+        # A menubar is a row of submenus (File, Edit, ...). OBS exposes its
+        # *tray* menu at /MenuBar - Hide, Open Preview Projector, Start
+        # Streaming, Start Recording, ... , Exit - where only two of eight
+        # entries have children, and presenting that as the app's menubar put
+        # tray commands in the bar as fake top-level menus. Require a majority
+        # of submenus: a real menubar is nearly all submenus, a flat or
+        # mostly-flat root never is.
+        if nested < 2 or nested * 2 < len(menubar):
+            log(f"dbusmenu {self.found[1]} is not menubar-shaped ({nested} submenus of {len(menubar)})")
+            return None
         return menubar
 
 
@@ -1059,6 +1103,30 @@ def _extract_dbusmenu(pid, app_name, address):
     except Exception as exc:  # noqa: BLE001
         log(f"DBusMenu extraction failed: {exc}")
         return None, None
+
+
+def _extract_dbusmenu_at(service, path):
+    """Read a dbusmenu an app registered with the registrar.
+
+    Skips discovery entirely: the registrar already knows the bus name and
+    object path, which is the whole point of serving it.
+    """
+    try:
+        extractor = DbusMenuExtractor(0, "", None)
+        extractor.found = (service, path)
+        menubar = extractor.build_at(service, path)
+        return menubar, extractor.found
+    except Exception as exc:  # noqa: BLE001
+        log(f"DBusMenu extraction at {service} {path} failed: {exc}")
+        return None, None
+
+
+def _registrar_menu_for(address):
+    """The (service, path) the registrar holds for a window address, if any."""
+    registrar = REGISTRAR
+    if registrar is None or not address:
+        return None
+    return registrar.menu_for_window(address)
 
 
 class AtspiMenuExtractor:
@@ -1232,7 +1300,7 @@ class AtspiMenuExtractor:
         return path
 
     def _clean_label(self, label):
-        return label.split("\t")[0]
+        return clean_menu_label(label)
 
     def _extract_children(self, parent_acc, prefix, base_path, depth=0):
         """Convert a menu's child accessibles into snapshot items."""
@@ -1349,6 +1417,400 @@ def _extract_atspi(pid, app_name, address):
     except Exception as exc:  # noqa: BLE001
         log(f"AT-SPI extraction failed: {exc}")
         return None, None
+
+
+def _extract_atspi(pid, app_name, address):
+    try:
+        extractor = AtspiMenuExtractor(pid, app_name, address)
+        menubar = extractor.build()
+        return menubar, extractor.found
+    except Exception as exc:  # noqa: BLE001
+        log(f"AT-SPI extraction failed: {exc}")
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# AT-SPI popover harvest (last real stage of the cascade)
+#
+# Some apps never expose a MENU_BAR accessible. Zed puts its menubar in the
+# title bar as a row of sibling buttons (Zed, File, Edit, Selection, View, Go,
+# Run, Window, Help), and each button's dropdown only exists while it is open:
+# activating the button creates a MENU accessible, activating it again removes
+# it. There is no static menu tree to read, so the only way to see the menu is
+# to open it, read it, and close it again.
+#
+# That is exactly what a screen reader does, and it is visible to the user: the
+# popups flash while the snapshot is built. It is therefore opt-in
+# (harvestMenus in ~/.config/omarchy/global-menu.json), cached per window title
+# so a focus change does not re-flash the menus, and bounded: a title bar with
+# fewer than three menu-shaped buttons is left alone, because a lone popover
+# (a GTK4 hamburger) is an application menu, not the app's menubar.
+# ---------------------------------------------------------------------------
+
+_HARVEST_CACHE = {}
+_HARVEST_CACHE_LIMIT = 32
+_HARVEST_MIN_BUTTONS = 3
+_HARVEST_BUTTON_ROLES = {
+    "ATSPI_ROLE_TOGGLE_BUTTON",
+    "ATSPI_ROLE_PUSH_BUTTON",
+    "ATSPI_ROLE_BUTTON",
+}
+
+
+def harvest_enabled():
+    return load_menu_config().get("harvestMenus") is True
+
+
+class PopoverHarvester:
+    """Reads a menubar that only exists while each button's popup is open."""
+
+    def __init__(self, pid, app_title):
+        self.pid = pid
+        self.app_title = app_title or ""
+        self.counter = 0
+        self.app = None
+
+    def nid(self, prefix):
+        self.counter += 1
+        return f"{prefix}.{self.counter}"
+
+    @staticmethod
+    def _role(acc):
+        try:
+            role = acc.get_role()
+            return role.value_name if role else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _name(acc):
+        try:
+            return (acc.get_name() or "") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def find_app(self):
+        Atspi = _atspi_import()
+        try:
+            desktop = Atspi.get_desktop(0)
+            count = desktop.get_child_count()
+        except Exception as exc:  # noqa: BLE001
+            log(f"harvest: AT-SPI desktop unavailable: {exc}")
+            return None
+        for i in range(count):
+            try:
+                app = desktop.get_child_at_index(i)
+            except Exception:  # noqa: BLE001
+                continue
+            if app is None:
+                continue
+            try:
+                if (app.get_process_id() or 0) == self.pid:
+                    self.app = app
+                    return app
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _menus(self):
+        """Every MENU accessible currently under the app, in tree order."""
+        found = []
+
+        def walk(acc, depth=0):
+            if acc is None or depth > 16:
+                return
+            if self._role(acc) == "ATSPI_ROLE_MENU":
+                found.append(acc)
+                return
+            try:
+                count = acc.get_child_count()
+            except Exception:  # noqa: BLE001
+                return
+            for i in range(count):
+                try:
+                    walk(acc.get_child_at_index(i), depth + 1)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        walk(self.app)
+        return found
+
+    def _titlebar_buttons(self):
+        """Buttons of the window's title-bar strip, if it looks like a menubar.
+
+        Zed puts a TOOL_BAR accessible named "Title bar" at the top of the
+        frame, holding 'Zed, File, Edit, Selection, View, Go, Run, Window,
+        Help, <project>, Sign In, User menu'. A second TOOL_BAR named "Status
+        bar" holds thirteen toggle buttons (Agent Panel, Git Panel, ...) which
+        are not menus at all — picking the widest strip by shape alone chose
+        that one and harvested nothing.
+
+        So prefer a container whose accessible name says it is the title bar,
+        and never one that says it is the status bar. Shape is only the
+        fallback, and the caller still proves each button opens a menu before
+        trusting it.
+        """
+        preferred = []
+        others = []
+
+        def walk(acc, depth=0):
+            if acc is None or depth > 12:
+                return
+            try:
+                container_name = self._name(acc).strip().lower()
+            except Exception:  # noqa: BLE001
+                container_name = ""
+            try:
+                count = acc.get_child_count()
+            except Exception:  # noqa: BLE001
+                return
+            buttons = []
+            for i in range(count):
+                try:
+                    child = acc.get_child_at_index(i)
+                except Exception:  # noqa: BLE001
+                    continue
+                if child is None or self._role(child) not in _HARVEST_BUTTON_ROLES:
+                    continue
+                buttons.append(child)
+            if len(buttons) >= _HARVEST_MIN_BUTTONS:
+                if "status" in container_name:
+                    pass
+                elif "title" in container_name:
+                    preferred.append((depth, len(buttons), buttons))
+                else:
+                    others.append((depth, len(buttons), buttons))
+            for i in range(count):
+                try:
+                    walk(acc.get_child_at_index(i), depth + 1)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        walk(self.app)
+        for pool in (preferred, others):
+            if pool:
+                pool.sort(key=lambda s: (s[0], -s[1]))
+                return pool[0][2]
+        return []
+
+    def _open(self, button):
+        try:
+            if button.get_n_actions() < 1:
+                return False
+            button.do_action(0)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"harvest: could not open {self._name(button)!r}: {exc}")
+            return False
+
+    def _wait_menu(self, timeout=0.5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            menus = self._menus()
+            if menus:
+                return menus[0]
+            time.sleep(0.03)
+        return None
+
+    def _wait_closed(self, timeout=0.5):
+        """Wait until no menu is open.
+
+        Every popup here is unnamed with index 0, so a newly opened menu cannot
+        be told apart from the previous one by identity: File was harvested
+        with Edit's items because the old popup was still in the tree. Waiting
+        for the tree to go quiet before the next button is deterministic.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._menus():
+                return True
+            time.sleep(0.03)
+        return False
+
+    def _harvest_button(self, button):
+        """Open a button, read its popup, close it, and settle. Items or None."""
+        # 0.5s was too tight: Run, Window and Help timed out intermittently
+        # while File/Edit/View opened in ~80ms, which silently dropped real
+        # menus. Retry once with a longer window rather than reporting a
+        # missing menu.
+        for attempt, timeout in enumerate((0.6, 1.2)):
+            if not self._open(button):
+                continue
+            try:
+                menu = self._wait_menu(timeout=timeout)
+                if menu is not None:
+                    return self._items(menu, "harvest", [self._name(button)])
+            finally:
+                self._open(button)  # close it again
+                self._wait_closed()
+            if attempt == 0:
+                time.sleep(0.1)
+        return None
+
+    def _items(self, menu, prefix, path=(), depth=0):
+        """One popup's children, in the snapshot schema.
+
+        `path` is the label route from the title-bar button down to this
+        popup, so each item can carry where it lives: the item action is
+        resolved by re-opening the button and walking that route.
+        """
+        if depth > 8:
+            return []
+        items = []
+        try:
+            count = menu.get_child_count()
+        except Exception:  # noqa: BLE001
+            return items
+        for i in range(count):
+            try:
+                child = menu.get_child_at_index(i)
+            except Exception:  # noqa: BLE001
+                continue
+            if child is None:
+                continue
+            role = self._role(child)
+            label = clean_menu_label(self._name(child))
+            if role == "ATSPI_ROLE_SEPARATOR":
+                items.append(
+                    {
+                        "id": self.nid(prefix),
+                        "label": "",
+                        "type": "separator",
+                        "enabled": False,
+                        "icon": "",
+                        "checkState": "none",
+                        "action": None,
+                    }
+                )
+                continue
+            if not label:
+                continue
+            entry = {
+                "id": self.nid(prefix),
+                "label": label,
+                "type": "item",
+                "enabled": True,
+                "icon": "",
+                "checkState": "none",
+                "action": None,
+            }
+            try:
+                states = child.get_state_set()
+                entry["enabled"] = bool(states.contains(_atspi_sensitive()))
+            except Exception:  # noqa: BLE001
+                pass
+            # A submenu only exists while hovered for some toolkits; harvest
+            # what is already there rather than driving more UI.
+            submenu = None
+            try:
+                for j in range(child.get_child_count()):
+                    sub = child.get_child_at_index(j)
+                    if sub is not None and self._role(sub) in ("ATSPI_ROLE_MENU", "ATSPI_ROLE_POPUP_MENU"):
+                        submenu = sub
+                        break
+            except Exception:  # noqa: BLE001
+                submenu = None
+            item_path = list(path) + [label]
+            if submenu is not None:
+                entry["type"] = "menu"
+                entry["action"] = {
+                    "kind": "atspi-harvest",
+                    "pid": self.pid,
+                    "title": self.app_title,
+                    "path": item_path,
+                }
+                entry["items"] = self._items(submenu, prefix, item_path, depth + 1)
+            else:
+                # Menu items are invoked by walking the same tree again, so
+                # the action carries the label path that produced it.
+                entry["action"] = {
+                    "kind": "atspi-harvest",
+                    "pid": self.pid,
+                    "title": self.app_title,
+                    "path": item_path,
+                }
+            items.append(entry)
+        return items
+
+    def build(self):
+        if self.find_app() is None:
+            log("harvest: app not on the accessibility bus")
+            return None
+        buttons = self._titlebar_buttons()
+        if len(buttons) < _HARVEST_MIN_BUTTONS:
+            log(f"harvest: only {len(buttons)} menu-shaped buttons, not a menubar")
+            return None
+        menubar = []
+        seen = set()
+        # The row is read as a run: skip the application menu (index 0, Zed →
+        # About/Quit), collect every button that opens a real menu, and stop at
+        # the first button that opens nothing (the project button, "Open
+        # Recent Project", the account menu). Matching the window title was
+        # tried and is unreliable: an empty project's title is "empty project",
+        # which matches no button, so Run/Window/Help were followed by
+        # "User menu" and a chrome popup landed in the menubar.
+        for index, button in enumerate(buttons):
+            label = self._name(button)
+            if not label or label in seen:
+                continue
+            if index == 0:
+                continue
+            items = self._harvest_button(button)
+            if not items:
+                # A menubar is contiguous: the first button that opens nothing
+                # ends it.
+                if menubar:
+                    break
+                continue
+            seen.add(label)
+            menubar.append(
+                {
+                    "id": self.nid("harvest"),
+                    "label": label,
+                    "type": "menu",
+                    "enabled": True,
+                    "icon": "",
+                    "checkState": "none",
+                    "action": None,
+                    "items": items,
+                }
+            )
+        return menubar or None
+
+
+def _atspi_sensitive():
+    """Atspi.StateType.SENSITIVE, imported once and cached."""
+    global _ATSPI_SENSITIVE
+    if _ATSPI_SENSITIVE is None:
+        _ATSPI_SENSITIVE = _atspi_import().StateType.SENSITIVE
+    return _ATSPI_SENSITIVE
+
+
+_ATSPI_SENSITIVE = None
+
+
+
+def _harvest_cache_key(pid, title):
+    return (int(pid or 0), str(title or ""))
+
+
+def harvest_menubar(pid, title):
+    """Harvest, reusing the last result for the same window title."""
+    key = _harvest_cache_key(pid, title)
+    if key in _HARVEST_CACHE:
+        return _HARVEST_CACHE[key]
+    harvester = PopoverHarvester(pid, title)
+    try:
+        menubar = harvester.build()
+    except Exception as exc:  # noqa: BLE001
+        log(f"harvest failed: {exc}")
+        menubar = None
+    # Cached as-is, including a miss: a title bar that is not a menubar must
+    # not be re-probed (and re-flashed) on every subsequent refresh.
+    _HARVEST_CACHE[key] = menubar
+    if len(_HARVEST_CACHE) > _HARVEST_CACHE_LIMIT:
+        _HARVEST_CACHE.pop(next(iter(_HARVEST_CACHE)))
+    return menubar
 
 
 def normalize_menus(menubar):
@@ -1682,7 +2144,16 @@ class SnapshotBuilder:
                 mark_negative_cache(self.pid, "org.gtk.Menus")
 
         if not check_negative_cache(self.pid, "dbusmenu"):
-            dbusmenu, found = _extract_dbusmenu(self.pid, self.app_name, self.address)
+            # A registered window already told us where its menu is; go
+            # straight there instead of guessing object paths.
+            registered = _registrar_menu_for(self.address)
+            dbusmenu, found = None, None
+            if registered:
+                dbusmenu, found = _extract_dbusmenu_at(registered[0], registered[1])
+                if dbusmenu:
+                    log(f"dbusmenu via registrar: {registered[0]} {registered[1]}")
+            if not dbusmenu:
+                dbusmenu, found = _extract_dbusmenu(self.pid, self.app_name, self.address)
             if dbusmenu:
                 clear_negative_cache(self.pid, "dbusmenu")
                 base.update(
@@ -1704,6 +2175,21 @@ class SnapshotBuilder:
                 return base
             else:
                 mark_negative_cache(self.pid, "at-spi")
+
+        # Last real stage: apps whose menubar is a row of title-bar buttons and
+        # whose menu only exists while a button's popup is open (Zed). Opt-in
+        # because harvesting flashes those popups on screen.
+        #
+        # No negative caching here: harvest is already memoised per (pid,
+        # title) in _HARVEST_CACHE, and the 60s extraction cache is the wrong
+        # tool because an app that is not yet on the accessibility bus (started
+        # before the a11y listener, or still opening its window) misses once
+        # and would then stay menu-less for a minute even after it is ready.
+        if harvest_enabled():
+            harvested = harvest_menubar(self.pid, self.title)
+            if harvested:
+                base.update({"source": "harvest", "menubar": normalize_menus(harvested)})
+                return base
 
         base["source"] = "desktop-fallback"
         base["menubar"] = [
@@ -1840,8 +2326,256 @@ def execute_action(action):
         return _execute_dbusmenu_event(action)
     if kind == "atspi":
         return _execute_atspi_action(action)
+    if kind == "atspi-harvest":
+        return _execute_harvest_action(action)
     log(f"unknown action kind: {kind}")
     return False
+
+
+def _execute_harvest_action(action):
+    """Re-open a harvested popup and click the item at its label path.
+
+    A harvested item has no standalone accessible to invoke: it only exists
+    while its button's popup is open. So open the top-level button again, walk
+    the popup by label, then do_action on the item — which also closes the
+    menu, because the app treats the activation as a click on it.
+    """
+    pid = action.get("pid") or 0
+    path = action.get("path") or []
+    if not pid or not path:
+        return False
+    harvester = PopoverHarvester(pid, action.get("title") or "")
+    if harvester.find_app() is None:
+        log("harvest activate: app not on the accessibility bus")
+        return False
+    top = path[0]
+    button = None
+    for candidate in harvester._titlebar_buttons():
+        if harvester._name(candidate) == top:
+            button = candidate
+            break
+    if button is None:
+        log(f"harvest activate: no title-bar button {top!r}")
+        return False
+    if not harvester._open(button):
+        return False
+    menu = harvester._wait_menu()
+    if menu is None:
+        return False
+    node = menu
+    for label in path[1:]:
+        found = None
+        try:
+            for i in range(node.get_child_count()):
+                child = node.get_child_at_index(i)
+                if child is not None and clean_menu_label(harvester._name(child)) == label:
+                    found = child
+                    break
+        except Exception:  # noqa: BLE001
+            found = None
+        if found is None:
+            harvester._open(button)
+            log(f"harvest activate: {label!r} not found under {top!r}")
+            return False
+        node = found
+        # Descend into a submenu if that is what the label names.
+        try:
+            for j in range(node.get_child_count()):
+                sub = node.get_child_at_index(j)
+                if sub is not None and harvester._role(sub) in ("ATSPI_ROLE_MENU", "ATSPI_ROLE_POPUP_MENU"):
+                    node = sub
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        if node.get_n_actions() < 1:
+            harvester._open(button)
+            log("harvest activate: item has no actions")
+            return False
+        node.do_action(0)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"harvest activate failed: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# com.canonical.AppMenu.Registrar (the layer that makes this global)
+#
+# Every toolkit that has a real menubar exports it in one of three ways, and
+# two of them only export at all when something is *listening*:
+#
+#   Qt6/KDE (Krita, Kate, Dolphin)
+#       libQt6Gui contains RegisterWindow/UnregisterWindow/GetMenuForWindow
+#       and the com.canonical.dbusmenu strings, but it registers with
+#       org.kde.kappmenu (Plasma) or com.canonical.AppMenu.Registrar
+#       (Unity/vala-panel). With neither present it exports nothing.
+#   LibreOffice (GTK3 VCL)
+#       libvclplug_gtk3lo.so imports com.canonical.AppMenu.Registrar and only
+#       hides its own menubar once the registrar replies.
+#   GTK3 apps
+#       need appmenu-gtk-module, which likewise exports to the registrar.
+#
+# So the reason a Plasma session "just works" is not Plasma magic: Plasma's
+# kded appmenu module *is* the registrar. Owning that name here gives the same
+# reach to this bridge, with no KDE installed, and it stops LibreOffice from
+# drawing a second copy of the menus the bar already shows.
+#
+# Interface (freedesktop appmenu spec):
+#   RegisterWindow(o window, o menu)        -> ()
+#   UnregisterWindow(o window)              -> ()
+#   GetMenuForWindow(u window)              -> (so)   [deprecated]
+#   GetMenus                               -> a(uso)  {window, service, path}
+#   signals: WindowRegistered(u window, s service), WindowUnregistered(u window)
+# ---------------------------------------------------------------------------
+
+REGISTRAR_NAME = "com.canonical.AppMenu.Registrar"
+REGISTRAR_PATH = "/com/canonical/AppMenu/Registrar"
+REGISTRAR_XML = """
+<node>
+  <interface name="com.canonical.AppMenu.Registrar">
+    <method name="RegisterWindow">
+      <arg type="u" name="windowId" direction="in"/>
+      <arg type="o" name="menuObjectPath" direction="in"/>
+    </method>
+    <method name="UnregisterWindow">
+      <arg type="u" name="windowId" direction="in"/>
+    </method>
+    <method name="GetMenuForWindow">
+      <arg type="u" name="windowId" direction="in"/>
+      <arg type="s" name="service" direction="out"/>
+      <arg type="o" name="menuObjectPath" direction="out"/>
+    </method>
+    <method name="GetMenus">
+      <arg type="a(uso)" name="menus" direction="out"/>
+    </method>
+    <signal name="WindowRegistered">
+      <arg type="u" name="windowId"/>
+      <arg type="s" name="service"/>
+    </signal>
+    <signal name="WindowUnregistered">
+      <arg type="u" name="windowId"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
+class AppMenuRegistrar:
+    """Serves com.canonical.AppMenu.Registrar and keeps the window -> menu map.
+
+    Ownership matters more than the contents: an app checks that the name is
+    taken before exporting, so a registrar that answers but stores nothing
+    still makes Qt and LibreOffice publish their menus. Every registered
+    window is kept so extraction can go straight to dbusmenu for it.
+    """
+
+    def __init__(self):
+        self.conn = None
+        self.registration_id = 0
+        self.menus = {}  # window id -> (service, object path)
+        self.node_info = None
+
+    def _on_call(self, conn, sender, path, iface, method, params, invocation):
+        try:
+            self._dispatch(conn, sender, method, params, invocation)
+        except Exception as exc:  # noqa: BLE001
+            log(f"registrar: {method} failed: {exc}")
+            try:
+                invocation.return_dbus_error(REGISTRAR_NAME + ".Failed", str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _dispatch(self, conn, sender, method, params, invocation):
+        Gio, GLib = _gio_import()
+        if method == "RegisterWindow":
+            window_id, menu_path = params.unpack()
+            self.menus[int(window_id)] = (str(sender), str(menu_path))
+            log(f"registrar: window {window_id} -> {sender} {menu_path}")
+            invocation.return_value(None)
+            return
+        if method == "UnregisterWindow":
+            (window_id,) = params.unpack()
+            if self.menus.pop(int(window_id), None) is not None:
+                log(f"registrar: window {window_id} unregistered")
+            invocation.return_value(None)
+            return
+        if method == "GetMenuForWindow":
+            (window_id,) = params.unpack()
+            service, path = self.menus.get(int(window_id), ("", "/"))
+            invocation.return_value(GLib.Variant("(so)", (service, path)))
+            return
+        if method == "GetMenus":
+            entries = [(int(win), service, path) for win, (service, path) in sorted(self.menus.items())]
+            invocation.return_value(GLib.Variant("(a(uso))", (entries,)))
+            return
+        invocation.return_dbus_error(
+            "org.freedesktop.DBus.Error.UnknownMethod", f"no such method {method}"
+        )
+
+    def start(self):
+        """Take the well-known name. Returns False when another registrar owns it."""
+        Gio, GLib = _gio_import()
+        try:
+            conn = _bus()
+            node = Gio.DBusNodeInfo.new_for_xml(REGISTRAR_XML)
+        except Exception as exc:  # noqa: BLE001
+            log(f"registrar: could not build interface: {exc}")
+            return False
+        interface = node.interfaces[0]
+        try:
+            self.registration_id = conn.register_object(
+                REGISTRAR_PATH,
+                interface,
+                self._on_call,
+                None,
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"registrar: could not register object: {exc}")
+            return False
+        if not self.registration_id:
+            log("registrar: object registration refused")
+            return False
+        try:
+            reply = conn.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "RequestName",
+                GLib.Variant("(su)", (REGISTRAR_NAME, 0x4)),  # DO_NOT_QUEUE
+                None,
+                Gio.DBusCallFlags.NONE,
+                2000,
+            )
+            result = reply.unpack()[0]
+        except Exception as exc:  # noqa: BLE001
+            log(f"registrar: RequestName failed: {exc}")
+            return False
+        # 1 = primary owner, 4 = already owner. Anything else means another
+        # registrar (Plasma's, say) holds it; leave theirs alone.
+        if result not in (1, 4):
+            log(f"registrar: name taken by another process (result={result})")
+            return False
+        self.conn = conn
+        log(f"registrar: serving {REGISTRAR_NAME}")
+        return True
+
+    def menu_for_window(self, window_address):
+        """(service, path) registered for a Hyprland window address, or None.
+
+        Apps register X11/Wayland window ids, which Hyprland reports as a hex
+        address. Only the low 32 bits are meaningful for X11 windows, so match
+        the numeric value rather than the string.
+        """
+        try:
+            wanted = int(str(window_address), 16)
+        except (TypeError, ValueError):
+            return None
+        for window_id, entry in self.menus.items():
+            if window_id == wanted:
+                return entry
+        return None
 
 
 def _execute_gtk_action(action):
@@ -2071,7 +2805,15 @@ def run_once():
 
 
 def run_daemon():
-    global DEBUG  # noqa: F811
+    global DEBUG, REGISTRAR  # noqa: F811
+    # Own com.canonical.AppMenu.Registrar before the first snapshot, so apps
+    # that need a listener register as they start and LibreOffice hides its
+    # own menubar from the outset. Losing to another registrar is fine.
+    registrar = AppMenuRegistrar()
+    if registrar.start():
+        REGISTRAR = registrar
+    else:
+        log("registrar unavailable; continuing without it")
     initial_window = active_window()
     snapshot = SnapshotBuilder(initial_window).build()
     write_snapshot(snapshot)
@@ -2096,6 +2838,9 @@ def run_daemon():
     def refresh_for(window):
         nonlocal snapshot, item_map, refresh_pending
         refresh_pending = False
+        # A window that comes back into focus may have rebuilt its title bar
+        # (project opened, panel toggled), so its harvested menu is stale.
+        _HARVEST_CACHE.pop(_harvest_cache_key(window.get("pid"), window.get("title")), None)
         snapshot = SnapshotBuilder(window).build()
         write_snapshot(snapshot)
         item_map = load_item_map(snapshot)
