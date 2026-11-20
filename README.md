@@ -112,6 +112,31 @@ Zed only builds an accessible tree when the experimental adapter is enabled:
 ZED_EXPERIMENTAL_A11Y=1 zeditor
 ```
 
+## Live menu updates
+
+The bridge refreshes the focused app's menu when that menu changes, not just
+on focus changes:
+
+- GTK3 (`org.gtk.Menus`) and dbusmenu apps emit D-Bus change signals, which the
+  daemon subscribes to directly.
+- Apps that expose their menus only through AT-SPI — Qt Quick apps such as
+  Devpad, GTK4 and Electron — are watched through AT-SPI `children-changed`,
+  name and state events. Events are filtered to the focused window's process
+  and debounced. A rebuild is published only when the menu content really
+  changed, so a checkmark toggle or a growing "Recent Files" submenu updates
+  the bar immediately without rewriting the snapshot for unrelated a11y
+  traffic.
+
+For apps that emit no usable change signal at all, periodic re-extraction can
+be enabled with:
+
+```json
+// ~/.config/omarchy/global-menu.json
+{ "pollIntervalSec": 5 }
+```
+
+`0` (the default) leaves refresh purely event-driven.
+
 ## Redundant separators
 
 Toolkits collapse redundant separators when they lay out a native menu: a

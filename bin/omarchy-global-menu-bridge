@@ -23,6 +23,7 @@ action (hyprctl dispatch or a launched command) back in the app.
 import argparse
 import base64
 import configparser
+import hashlib
 import json
 import os
 import select
@@ -42,7 +43,12 @@ MENU_CONFIG_FILE = Path(
     os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
 ) / "omarchy" / "global-menu.json"
 
-_MENU_CONFIG_DEFAULTS = {"name": "Omarchy", "icon": "omarchy", "harvestMenus": False}
+_MENU_CONFIG_DEFAULTS = {
+    "name": "Omarchy",
+    "icon": "omarchy",
+    "harvestMenus": False,
+    "pollIntervalSec": 0.0,
+}
 _menu_config_cache = {"mtime": None, "data": dict(_MENU_CONFIG_DEFAULTS)}
 
 
@@ -50,12 +56,18 @@ def load_menu_config():
     """User overrides for the fallback menu and the popover harvest.
 
     Reads ~/.config/omarchy/global-menu.json:
-      {"fallbackName": "...", "fallbackIcon": "...", "harvestMenus": true}
+      {"fallbackName": "...", "fallbackIcon": "...", "harvestMenus": true,
+       "pollIntervalSec": 5}
 
     `harvestMenus` turns on the last-resort path that opens an app's title-bar
     menus to read them (see PopoverHarvester): it makes menus appear for apps
     that expose none, at the cost of those popups flashing on screen while the
     snapshot is built. Off by default.
+
+    `pollIntervalSec` re-extracts the focused app's menu periodically as a
+    catch-all for apps that emit no change signal at all. 0 (the default)
+    leaves refresh entirely event-driven. Snapshots that come back identical
+    are not re-published, so polling is cheap for static menus.
 
     Missing/corrupt file or empty values fall back to defaults. Mtime-cached
     so each snapshot build re-reads cheaply and edits apply live.
@@ -78,6 +90,12 @@ def load_menu_config():
                         data["icon"] = icon
                     if "harvestMenus" in parsed:
                         data["harvestMenus"] = parsed.get("harvestMenus") is True
+                    if "pollIntervalSec" in parsed:
+                        try:
+                            interval = float(parsed.get("pollIntervalSec") or 0)
+                        except (TypeError, ValueError):
+                            interval = 0.0
+                        data["pollIntervalSec"] = max(0.0, min(interval, 3600.0))
             except (OSError, json.JSONDecodeError):
                 pass
         _menu_config_cache["mtime"] = mtime
@@ -1192,7 +1210,7 @@ class AtspiMenuExtractor:
         if states is None:
             return True
         try:
-            return bool(states.contains(Atspi.StateType.SENSITIVE))
+            return bool(states.contains(_atspi_import().StateType.SENSITIVE))
         except Exception:  # noqa: BLE001
             return True
 
@@ -1202,6 +1220,7 @@ class AtspiMenuExtractor:
         if states is None:
             return "none"
         try:
+            Atspi = _atspi_import()
             role = AtspiMenuExtractor._role(acc)
             if "RADIO" in role:
                 if states.contains(Atspi.StateType.CHECKED):
@@ -1214,6 +1233,22 @@ class AtspiMenuExtractor:
         except Exception:  # noqa: BLE001
             pass
         return "none"
+
+    @staticmethod
+    def _visible(acc):
+        """Whether an accessible is actually laid out in the app's menu.
+
+        Qt keeps hidden QActions (setVisible(false)) in the accessibility tree,
+        but they have no geometry and therefore no AT-SPI Component interface.
+        They look like ordinary menu items to a tree walk, which is how stale,
+        invisible entries end up in the snapshot. A visible action — even a
+        disabled one — always has a Component. The reverse is also true for the
+        toolkits we support (GTK exposes Component on its menu items too).
+        """
+        try:
+            return "Component" in {str(iface) for iface in acc.get_interfaces()}
+        except Exception:  # noqa: BLE001
+            return True  # can't tell -> keep the item
 
     def _find_role(self, acc, roles, depth=0):
         """First accessible whose role is in `roles` (depth-first)."""
@@ -1310,15 +1345,27 @@ class AtspiMenuExtractor:
             count = parent_acc.get_child_count()
         except Exception:  # noqa: BLE001
             return []
-        items_out = []
+        children = []
         for i in range(count):
             try:
                 child = parent_acc.get_child_at_index(i)
             except Exception:  # noqa: BLE001
                 continue
-            if child is None:
+            if child is not None:
+                children.append((i, child, self._role(child)))
+
+        # Only filter when this menu is mostly laid-out items. A toolkit that
+        # exposes no Component at all would otherwise have its entire menu
+        # dropped; the majority check keeps the filter Qt-specific in effect.
+        laid_out = [(i, c, r) for i, c, r in children if r in self._ITEM_ROLES]
+        visible_count = sum(1 for _, c, _ in laid_out if self._visible(c))
+        filter_hidden = bool(laid_out) and visible_count * 2 >= len(laid_out)
+
+        items_out = []
+        for i, child, role in children:
+            if filter_hidden and role in self._ITEM_ROLES and not self._visible(child):
+                log(f"atspi: hiding non-visible menu item {self._name(child)!r}")
                 continue
-            role = self._role(child)
             if role == "ATSPI_ROLE_SEPARATOR":
                 items_out.append(
                     {
@@ -1450,6 +1497,10 @@ def _extract_atspi(pid, app_name, address):
 _HARVEST_CACHE = {}
 _HARVEST_CACHE_LIMIT = 32
 _HARVEST_MIN_BUTTONS = 3
+# Harvesting opens and closes a popup for each menu button, which generates a
+# burst of AT-SPI events. The change watcher must ignore those or every
+# harvest would schedule another refresh of the menu it just harvested.
+_HARVESTING = False
 _HARVEST_BUTTON_ROLES = {
     "ATSPI_ROLE_TOGGLE_BUTTON",
     "ATSPI_ROLE_PUSH_BUTTON",
@@ -1796,15 +1847,19 @@ def _harvest_cache_key(pid, title):
 
 def harvest_menubar(pid, title):
     """Harvest, reusing the last result for the same window title."""
+    global _HARVESTING  # noqa: F811
     key = _harvest_cache_key(pid, title)
     if key in _HARVEST_CACHE:
         return _HARVEST_CACHE[key]
     harvester = PopoverHarvester(pid, title)
+    _HARVESTING = True
     try:
         menubar = harvester.build()
     except Exception as exc:  # noqa: BLE001
         log(f"harvest failed: {exc}")
         menubar = None
+    finally:
+        _HARVESTING = False
     # Cached as-is, including a miss: a title bar that is not a menubar must
     # not be re-probed (and re-flashed) on every subsequent refresh.
     _HARVEST_CACHE[key] = menubar
@@ -2287,6 +2342,28 @@ def write_private_text(path, text):
 def write_snapshot(snapshot):
     ensure_private_state()
     write_private_text(ACTIVE_FILE, json.dumps(snapshot, ensure_ascii=False))
+
+
+def snapshot_signature(snapshot):
+    """Content signature of a snapshot, ignoring generated ids and title.
+
+    Extractors number items from scratch on every build, and all at-spi
+    actions store an index path that shifts whenever an item is inserted.
+    A byte-for-byte compare would therefore call even an unchanged rebuild a
+    change, rewriting active.json and making the bar reload (and reshape an
+    open popup) for nothing. The window title changes on every keystroke in
+    most editors and is not rendered by the widget, so it is ignored too.
+    """
+    def strip(value):
+        if isinstance(value, dict):
+            return {key: strip(item) for key, item in value.items() if key != "id"}
+        if isinstance(value, list):
+            return [strip(item) for item in value]
+        return value
+
+    data = strip(snapshot)
+    data.pop("title", None)  # top-level window title only; harvest actions keep theirs
+    return json.dumps(data, sort_keys=True, ensure_ascii=False)
 
 
 def load_item_map(snapshot):
@@ -2798,6 +2875,103 @@ class MenuChangeWatcher:
         self.on_change = None
 
 
+class AtspiChangeWatcher:
+    """Notices menu edits in apps that only expose their menus via AT-SPI.
+
+    MenuChangeWatcher covers org.gtk.Menus and dbusmenu, but Qt Quick (Devpad),
+    GTK4 and Electron expose their menus only through the accessibility tree:
+    things like a Recent Files repeater growing or a checkable View item
+    toggling emit AT-SPI events, not D-Bus menu-model signals. Without this
+    watcher the published snapshot would stay stale until focus moved away
+    and back.
+
+    Events from every app on the accessibility bus arrive here, so they are
+    filtered to the focused window's pid and debounced before a refresh is
+    requested. The listener's callbacks are dispatched by the GLib main
+    context that run_daemon() already iterates for the D-Bus menu watcher.
+    """
+
+    DEBOUNCE = 0.2
+    MAX_WAIT = 1.0
+
+    EVENTS = (
+        "object:children-changed:add",
+        "object:children-changed:remove",
+        "object:property-change:accessible-name",
+        "object:state-changed:sensitive",
+        "object:state-changed:enabled",
+        "object:state-changed:checked",
+        "object:state-changed:visible",
+        "object:state-changed:expanded",
+    )
+
+    def __init__(self):
+        self.listener = None
+        self.pid = 0
+        self.due_at = 0.0
+        self.first_at = 0.0
+
+    @staticmethod
+    def _source_pid(acc, depth=0):
+        """Process id of the app an event source belongs to."""
+        if acc is None or depth > 6:
+            return 0
+        try:
+            pid = acc.get_process_id()
+            if pid:
+                return int(pid)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            parent = acc.get_parent()
+        except Exception:  # noqa: BLE001
+            return 0
+        return AtspiChangeWatcher._source_pid(parent, depth + 1)
+
+    def _on_event(self, event, user_data=None):
+        if _HARVESTING or not self.pid:
+            return
+        try:
+            pid = self._source_pid(event.source)
+        except Exception:  # noqa: BLE001
+            return
+        if pid != self.pid:
+            return
+        now = time.monotonic()
+        if not self.first_at:
+            self.first_at = now
+        self.due_at = now + self.DEBOUNCE
+        log(f"atspi menu change: {getattr(event, 'type', '?')}")
+
+    def start(self):
+        if self.listener is not None:
+            return
+        try:
+            Atspi = _atspi_import()
+            Atspi.get_desktop(0)  # establish the a11y connection first
+            listener = Atspi.EventListener.new(self._on_event, None)
+            for event_type in self.EVENTS:
+                if not listener.register(event_type):
+                    log(f"atspi: could not register {event_type}")
+            self.listener = listener
+            log("watching AT-SPI menu-change events")
+        except Exception as exc:  # noqa: BLE001
+            log(f"atspi change watcher unavailable: {exc}")
+            self.listener = None
+
+    def poll(self, now):
+        if not self.due_at:
+            return False
+        if now < self.due_at and now - self.first_at < self.MAX_WAIT:
+            return False
+        self.clear()
+        return True
+
+    def clear(self):
+        self.due_at = 0.0
+        self.first_at = 0.0
+
+
 def run_once():
     snapshot = SnapshotBuilder(active_window()).build()
     write_snapshot(snapshot)
@@ -2817,15 +2991,19 @@ def run_daemon():
     initial_window = active_window()
     snapshot = SnapshotBuilder(initial_window).build()
     write_snapshot(snapshot)
+    last_signature = snapshot_signature(snapshot)
     item_map = load_item_map(snapshot)
     watcher = MenuChangeWatcher()
     watcher.watch(snapshot, lambda: refresh_on_menu_change())
+    atspi_watcher = AtspiChangeWatcher()
+    atspi_watcher.pid = initial_window.get("pid") or 0
     last_window_key = (initial_window.get("address"), initial_window.get("pid"), initial_window.get("class"))
 
     sock = connect_events()
     buffer = ""
     last_request_mtime = 0.0
     refresh_pending = False
+    refresh_forced = False
 
     # Make apps publish their accessible menus. Without an AT-SPI event
     # listener registered, at-spi2-core >= 2.62 reports accessibility as
@@ -2833,25 +3011,49 @@ def run_daemon():
     # tree, and menu extraction falls back to the synthetic desktop menu.
     enable_atspi()
     force_a11y_enabled()
+    atspi_watcher.start()
     last_a11y_check = time.monotonic()
+    last_poll = time.monotonic()
 
-    def refresh_for(window):
-        nonlocal snapshot, item_map, refresh_pending
+    def refresh_for(window, force=False):
+        nonlocal snapshot, item_map, refresh_pending, refresh_forced, last_signature
         refresh_pending = False
+        refresh_forced = False
+        atspi_watcher.pid = window.get("pid") or 0
+        atspi_watcher.clear()
+        if force:
+            # A change signal says the app rebuilt its menu, so a cached
+            # negative result from an earlier, transient miss must not keep
+            # it on the fallback for another minute.
+            pid = window.get("pid") or 0
+            if pid:
+                for source in ("org.gtk.Menus", "dbusmenu", "at-spi"):
+                    clear_negative_cache(pid, source)
         # A window that comes back into focus may have rebuilt its title bar
         # (project opened, panel toggled), so its harvested menu is stale.
         _HARVEST_CACHE.pop(_harvest_cache_key(window.get("pid"), window.get("title")), None)
-        snapshot = SnapshotBuilder(window).build()
+        candidate = SnapshotBuilder(window).build()
+        signature = snapshot_signature(candidate)
+        digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
+        if signature == last_signature:
+            log(f"menu unchanged (source={candidate.get('source')}, sig={digest}); keeping snapshot")
+            return
+        snapshot = candidate
+        last_signature = signature
         write_snapshot(snapshot)
         item_map = load_item_map(snapshot)
         watcher.watch(snapshot, lambda: refresh_on_menu_change())
-        log(f"refreshed '{snapshot['appName']}' (source={snapshot['source']})")
+        log(f"refreshed '{snapshot['appName']}' (source={snapshot['source']}, sig={digest})")
 
-    def refresh_on_menu_change():
-        nonlocal refresh_pending
+    def request_refresh(force=False):
+        nonlocal refresh_pending, refresh_forced
         if refresh_pending:
             return
         refresh_pending = True
+        refresh_forced = force
+
+    def refresh_on_menu_change():
+        request_refresh(force=True)
 
     while True:
         refreshed = False
@@ -2865,14 +3067,27 @@ def run_daemon():
             if not enable_atspi(force=True):
                 force_a11y_enabled()
 
+        # Qt/GTK4/Electron menus have no D-Bus change signal: their edits show
+        # up as AT-SPI events, debounced by the watcher before landing here.
+        if atspi_watcher.poll(now):
+            request_refresh(force=True)
+
+        # Optional catch-all for apps that emit no usable change signal at
+        # all. 0 (the default) keeps refresh purely event-driven.
+        poll_interval = load_menu_config().get("pollIntervalSec") or 0.0
+        if poll_interval and now - last_poll >= poll_interval:
+            last_poll = now
+            request_refresh(force=True)
+
         if refresh_pending:
             window = active_window()
             if is_shell_window(window):
                 refresh_pending = False
+                refresh_forced = False
             else:
                 win_key = (window.get("address"), window.get("pid"), window.get("class"))
                 last_window_key = win_key
-                refresh_for(window)
+                refresh_for(window, force=refresh_forced)
         if sock is None:
             sock = connect_events()
             time.sleep(1)
