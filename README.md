@@ -114,6 +114,11 @@ ZED_EXPERIMENTAL_A11Y=1 zeditor
 
 ## Live menu updates
 
+Every snapshot is normalized to put a `|` top-level item between the app menu
+and the rest of the strip (`App Name | File Edit …`). Apps that already ship a
+native `|` item (Devpad) are left as-is; for everyone else the bridge inserts
+one, so the bar looks consistent regardless of the extraction source.
+
 The bridge refreshes the focused app's menu when that menu changes, not just
 on focus changes:
 

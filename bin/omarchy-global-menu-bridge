@@ -2124,7 +2124,7 @@ class SnapshotBuilder:
         }
 
 
-    def build(self):
+    def _build(self):
         base = {
             "appId": self.app_id,
             "appName": self.app_name,
@@ -2257,6 +2257,11 @@ class SnapshotBuilder:
         ]
         return base
 
+    def build(self):
+        snapshot = self._build()
+        ensure_app_separator(snapshot.get("menubar"))
+        return snapshot
+
 
 def ensure_private_state():
     """Make the state directory and any existing state files private.
@@ -2342,6 +2347,34 @@ def write_private_text(path, text):
 def write_snapshot(snapshot):
     ensure_private_state()
     write_private_text(ACTIVE_FILE, json.dumps(snapshot, ensure_ascii=False))
+
+
+def ensure_app_separator(menubar):
+    """Ensure a '|' item sits between the app menu and the rest of the bar.
+
+    Some apps (Devpad) ship a native '|' top-level item; most others don't.
+    Normalizing here keeps the strip consistent regardless of which extraction
+    path produced it. Applied after every build, including all early returns.
+    """
+    if not isinstance(menubar, list) or len(menubar) < 2:
+        return menubar
+    second = menubar[1]
+    if isinstance(second, dict) and clean_menu_label(second.get("label", "")) == "|":
+        return menubar
+    menubar.insert(
+        1,
+        {
+            "id": "app-menu-separator",
+            "label": "|",
+            "type": "separator",
+            "enabled": False,
+            "icon": "",
+            "checkState": "none",
+            "action": None,
+            "items": [],
+        },
+    )
+    return menubar
 
 
 def snapshot_signature(snapshot):

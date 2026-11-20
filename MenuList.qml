@@ -214,6 +214,10 @@ Item {
       readonly property var item: row.modelData
       readonly property bool isSeparator: item.type === "separator"
       readonly property bool isSubmenu: !!(item.type === "menu" && item.items && item.items.length > 0)
+      readonly property bool hasAction: !!(item.action && item.action.kind)
+      // A menu with nothing to show and no action to run is rendered dimmed
+      // and inert, matching the top-level strip's treatment of empty entries.
+      readonly property bool isEmptyMenu: item.type === "menu" && !row.isSubmenu && !row.hasAction
       readonly property bool isEnabled: item.enabled !== false
       readonly property string checkState: String(item.checkState || "none")
       readonly property bool hasIndicator: checkState !== "none"
@@ -284,7 +288,9 @@ Item {
         anchors.rightMargin: row.rightReserved
         anchors.verticalCenter: parent.verticalCenter
         text: row.item.label || ""
-        color: row.isEnabled ? (row.hovered ? root.selectedText : root.foreground) : root.dimColor
+        color: (row.isEmptyMenu || !row.isEnabled)
+          ? root.dimColor
+          : (row.hovered ? root.selectedText : root.foreground)
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         elide: Text.ElideRight
@@ -302,9 +308,10 @@ Item {
       }
 
       MouseArea {
-        visible: !row.isSeparator
+        visible: !row.isSeparator && !row.isEmptyMenu
+        enabled: !row.isEmptyMenu
         anchors.fill: parent
-        hoverEnabled: true
+        hoverEnabled: !row.isEmptyMenu
         cursorShape: row.isEnabled ? Qt.PointingHandCursor : Qt.ArrowCursor
         onEntered: row.hovered = true
         onExited: row.hovered = false

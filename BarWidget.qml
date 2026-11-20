@@ -80,7 +80,9 @@ BarWidget {
 
   function syncOpenEntry() {
     if (root.openIndex >= 0) {
-      if (root.openIndex >= root.menubar.length) {
+      var openItem = root.menubar[root.openIndex]
+      var stillOpenable = openItem && openItem.items && openItem.items.length > 0
+      if (root.openIndex >= root.menubar.length || !stillOpenable) {
         root.setOpenIndex(-1)
       } else {
         root.openEntry = entryRepeater.itemAt(root.openIndex)
@@ -201,8 +203,13 @@ BarWidget {
       readonly property string label: String(entry.entryItem && entry.entryItem.label || "")
       readonly property bool hasSubmenu: !!(entry.entryItem && entry.entryItem.items && entry.entryItem.items.length > 0)
       readonly property bool hasAction: !!(entry.entryItem && entry.entryItem.action && entry.entryItem.action.kind)
+      // Empty menus (and the injected '|') are shown but inert: no hover pill,
+      // no popup, dimmed text, like a disabled item in a native menubar.
+      readonly property bool isEmpty: !entry.hasSubmenu && !entry.hasAction
+      readonly property color foregroundColor: root.bar ? root.bar.barForeground : Color.foreground
+      readonly property color dimColor: Qt.rgba(entry.foregroundColor.r, entry.foregroundColor.g, entry.foregroundColor.b, 0.55)
       readonly property bool isOpen: root.openIndex === entry.index
-      readonly property bool highlighted: entry.hovered || entry.isOpen
+      readonly property bool highlighted: !entry.isEmpty && (entry.hovered || entry.isOpen)
 
       visible: !root.vertical
       implicitWidth: Math.max(Style.space(8), labelText.implicitWidth + Style.space(16))
@@ -219,9 +226,9 @@ BarWidget {
         id: labelText
         anchors.centerIn: parent
         text: entry.label
-        color: entry.highlighted
-          ? Color.menu.selectedText
-          : (root.bar ? root.bar.barForeground : Color.foreground)
+        color: entry.isEmpty
+          ? entry.dimColor
+          : (entry.highlighted ? Color.menu.selectedText : entry.foregroundColor)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.body
         renderType: Text.NativeRendering
@@ -229,7 +236,8 @@ BarWidget {
 
       MouseArea {
         anchors.fill: parent
-        hoverEnabled: true
+        enabled: !entry.isEmpty
+        hoverEnabled: !entry.isEmpty
         onEntered: {
           entry.hovered = true
           if (root.openIndex >= 0 && root.openIndex !== entry.index && entry.hasSubmenu) root.setOpenIndex(entry.index)
