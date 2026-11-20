@@ -2259,7 +2259,7 @@ class SnapshotBuilder:
 
     def build(self):
         snapshot = self._build()
-        ensure_app_separator(snapshot.get("menubar"))
+        ensure_app_separator(snapshot.get("menubar"), self)
         return snapshot
 
 
@@ -2349,18 +2349,34 @@ def write_snapshot(snapshot):
     write_private_text(ACTIVE_FILE, json.dumps(snapshot, ensure_ascii=False))
 
 
-def ensure_app_separator(menubar):
-    """Ensure a '|' item sits between the app menu and the rest of the bar.
+def ensure_app_separator(menubar, builder=None):
+    """Normalize the top strip to 'App Menu | File Edit …'.
 
     Some apps (Devpad) ship a native '|' top-level item; most others don't.
-    Normalizing here keeps the strip consistent regardless of which extraction
-    path produced it. Applied after every build, including all early returns.
+    Only the fallback paths synthesize an app menu, so real extraction paths
+    (and OBS's curated fallback) would otherwise start at 'File' and end up
+    with the injected separator between File and Edit. Make both guarantees
+    here, after every build including all early returns:
+
+      1. a real app menu at index 0, synthesized when the menubar lacks one;
+      2. a '|' item at index 1 separating it from the rest of the strip.
     """
     if not isinstance(menubar, list) or len(menubar) < 2:
         return menubar
     second = menubar[1]
     if isinstance(second, dict) and clean_menu_label(second.get("label", "")) == "|":
+        # Already normalized by the app itself (Devpad). Leave it alone.
         return menubar
+
+    first = menubar[0]
+    app_label = clean_menu_label(getattr(builder, "app_name", "") or "").lower()
+    is_app_menu = isinstance(first, dict) and (
+        first.get("id") == "app"
+        or (bool(app_label) and clean_menu_label(first.get("label", "")).lower() == app_label)
+    )
+    if not is_app_menu and builder is not None:
+        menubar.insert(0, builder.app_menu())
+
     menubar.insert(
         1,
         {

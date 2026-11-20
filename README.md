@@ -115,9 +115,12 @@ ZED_EXPERIMENTAL_A11Y=1 zeditor
 ## Live menu updates
 
 Every snapshot is normalized to put a `|` top-level item between the app menu
-and the rest of the strip (`App Name | File Edit …`). Apps that already ship a
-native `|` item (Devpad) are left as-is; for everyone else the bridge inserts
-one, so the bar looks consistent regardless of the extraction source.
+and the rest of the strip (`App Name | File Edit …`). Extraction paths that
+don't produce an app menu of their own (including OBS's curated fallback) get
+one synthesized from the app's desktop entry, so the separator always lands
+after the app name rather than between `File` and `Edit`. Apps that already
+ship both an app menu and a native `|` item (Devpad) are left as-is. The strip
+therefore looks consistent regardless of the extraction source.
 
 The bridge refreshes the focused app's menu when that menu changes, not just
 on focus changes:
