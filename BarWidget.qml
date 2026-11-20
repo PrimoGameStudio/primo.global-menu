@@ -13,6 +13,10 @@ BarWidget {
   id: root
   moduleName: "primo.global-menu"
 
+  // Off by default: colored app icons keep their own palette unless the user
+  // asks for monochrome icons to follow the Omarchy theme accent.
+  readonly property bool tintMonochromeIcons: setting("tintMonochromeIcons", false) === true
+
   readonly property var dataLoaderItem: dataLoader.item
   readonly property var record: dataLoaderItem ? dataLoaderItem.record : null
   readonly property var menubar: dataLoaderItem ? dataLoaderItem.menubar : []
@@ -154,12 +158,18 @@ BarWidget {
         // Non-empty icons that don't resolve to an image (file path or theme
         // icon) are treated as Nerd Font glyphs and rendered as text.
         readonly property bool hasGlyph: String(root.appIcon || "") !== "" && root.appIconUrl === ""
+        // The shader decides from the pixels which parts are monochrome, so a
+        // name-suffix check cannot miss path-based SVG/PNG app icons. The Image
+        // stays visible underneath as a fallback if the shader cannot load.
+        readonly property bool tintAppIcon: root.tintMonochromeIcons
+          && root.appIconUrl !== ""
         visible: (root.appIconUrl !== "" || iconWrap.hasGlyph) && !root.vertical
         width: Style.space(24)
         height: root.barSize
         implicitWidth: Style.space(24)
 
         Image {
+          id: appIconImage
           anchors.centerIn: parent
           width: Style.space(16)
           height: Style.space(16)
@@ -171,11 +181,23 @@ BarWidget {
           visible: root.appIconUrl !== ""
         }
 
+        ShaderEffect {
+          anchors.fill: appIconImage
+          visible: iconWrap.tintAppIcon
+          property variant sourceItem: appIconImage
+          property color tintColor: Color.accent
+          // Qt 6 requires a preprocessed .qsb shader (built from
+          // shaders/monochrome-tint.frag with the Qt Shader Baker).
+          fragmentShader: Qt.resolvedUrl("shaders/monochrome-tint.frag.qsb")
+        }
+
         Text {
           anchors.centerIn: parent
           visible: iconWrap.hasGlyph
           text: root.appIcon
-          color: root.bar ? root.bar.barForeground : Color.foreground
+          color: root.tintMonochromeIcons && iconWrap.hasGlyph
+            ? Color.accent
+            : (root.bar ? root.bar.barForeground : Color.foreground)
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.body
           renderType: Text.NativeRendering
@@ -365,6 +387,7 @@ BarWidget {
         list.selectedBackground = Color.menu.selectedBackground
         list.selectedText = Color.menu.selectedText
         list.separatorColor = Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.22)
+        list.tintMonochromeIcons = root.tintMonochromeIcons
         list.items = (menuPopup.menu && menuPopup.menu.items) ? menuPopup.menu.items : []
         list.activated.connect(function(item) { root.activate(item) })
       }

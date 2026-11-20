@@ -142,6 +142,25 @@ be enabled with:
 
 `0` (the default) leaves refresh purely event-driven.
 
+## Icon tinting
+
+Monochrome icons can be recolored with the active Omarchy theme accent. It is
+off by default; enable it in the widget's `shell.json` entry:
+
+```json
+// ~/.config/omarchy/shell.json — under bar.layout.<section>
+{ "id": "primo.global-menu", "tintMonochromeIcons": true }
+```
+
+The bar's app icon is tinted per pixel: desaturated (white/grey) parts follow
+the accent, while colored parts keep their own palette. This works for any
+source — a themed name, an absolute path to a single-color SVG, or a PNG — with
+no reliance on the icon's name. Menu item icons still use the freedesktop
+`-symbolic` convention, and the Nerd Font glyph fallback is tinted directly.
+
+The accent follows theme changes live, so tinted icons restyle without a shell
+restart.
+
 ## Redundant separators
 
 Toolkits collapse redundant separators when they lay out a native menu: a

@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import Quickshell
 import qs.Commons
 import qs.Ui
@@ -16,6 +17,9 @@ Item {
 
   property var items: []
   property var bar: null
+  // Propagated from the bar widget and to nested submenu lists: only symbolic
+  // icons are recolored, so colored app icons keep their own palette.
+  property bool tintMonochromeIcons: false
   property string fontFamily: Style.font.family
   property color foreground: Color.popups.text
   property color dimColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.55)
@@ -101,6 +105,13 @@ Item {
     var themed = Quickshell.iconPath(value, true)
     if (themed.length > 0) return themed
     return ""
+  }
+
+  // Same rule as the bar widget and the bar's tray widget: freedesktop
+  // symbolic icons carry a fixed fill meant to be recolored by the host.
+  function iconIsMonochrome(icon) {
+    var name = String(icon || "").split("?")[0]
+    return name.slice(-9) === "-symbolic"
   }
 
   function measure(label) {
@@ -222,6 +233,8 @@ Item {
       readonly property string checkState: String(item.checkState || "none")
       readonly property bool hasIndicator: checkState !== "none"
       readonly property bool hasIcon: String(item.icon || "") !== ""
+      readonly property bool tintIcon: root.tintMonochromeIcons && row.hasIcon
+        && root.iconIsMonochrome(row.item.icon)
 
       readonly property real leftConsumed: root.rowPaddingX
         + (row.hasIndicator ? root.indicatorSize + root.itemSpacing : 0)
@@ -266,7 +279,8 @@ Item {
       }
 
       Image {
-        visible: row.hasIcon && !row.isSeparator
+        id: itemIcon
+        visible: row.hasIcon && !row.isSeparator && !row.tintIcon
         anchors.left: parent.left
         anchors.leftMargin: root.rowPaddingX + (row.hasIndicator ? root.indicatorSize + root.itemSpacing : 0)
         anchors.verticalCenter: parent.verticalCenter
@@ -277,6 +291,15 @@ Item {
         sourceSize.height: root.iconSize * Screen.devicePixelRatio
         fillMode: Image.PreserveAspectFit
         asynchronous: true
+        layer.enabled: row.tintIcon
+      }
+
+      MultiEffect {
+        anchors.fill: itemIcon
+        source: itemIcon
+        visible: row.tintIcon
+        colorization: 1.0
+        colorizationColor: Color.accent
       }
 
       Text {
@@ -426,6 +449,7 @@ Item {
             list.selectedBackground = root.selectedBackground
             list.selectedText = root.selectedText
             list.separatorColor = root.separatorColor
+            list.tintMonochromeIcons = root.tintMonochromeIcons
             list.items = flyout.submenuItems
             list.activated.connect(function(item) { root.activated(item) })
           }
