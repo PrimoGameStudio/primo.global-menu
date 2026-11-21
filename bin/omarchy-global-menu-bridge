@@ -2004,10 +2004,10 @@ class SnapshotBuilder:
             self.item(prefix, "Capture Screenshot", self.exec_cmd("omarchy-capture-screenshot")),
             self.separator(prefix),
             self.item(prefix, "Lock Screen", self.exec_cmd("omarchy-system-lock")),
-            self.item(prefix, "Logout", self.exec_cmd("omarchy-system-logout")),
+            self.item(prefix, "Logout", self.exec_cmd("omarchy-system logout")),
             self.separator(prefix),
-            self.item(prefix, "Reboot", self.exec_cmd("omarchy-system-reboot")),
-            self.item(prefix, "Shutdown", self.exec_cmd("omarchy-system-shutdown")),
+            self.item(prefix, "Reboot", self.exec_cmd("omarchy-system reboot")),
+            self.item(prefix, "Shutdown", self.exec_cmd("omarchy-system shutdown")),
         ]
         return {"id": prefix, "label": cfg["name"], "type": "menu", "items": items}
 
